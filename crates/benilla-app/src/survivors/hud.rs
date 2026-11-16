@@ -14,7 +14,7 @@ use bevy::window::PrimaryWindow;
 use super::data::{self, AbilityDef, Effect, Kind, PassiveDef, Stat};
 use super::hero::{self, Hero};
 use super::minimap::{self, MiniMap};
-use super::{Owned, Phase, Rng, Run, Selection, Stats};
+use super::{perk_shop, perks, Owned, Phase, Rng, Run, Selection, Stats};
 
 const GOLD: Color = Color::srgb(1.0, 0.82, 0.0);
 /// The mobility button's edge, an action button's 36 units.
@@ -106,6 +106,8 @@ pub(super) struct OverTitle;
 pub(super) struct OverStats;
 #[derive(Component)]
 pub(super) struct OverLine;
+#[derive(Component)]
+pub(super) struct OverReward;
 #[derive(Component)]
 pub(super) struct OverStat(usize);
 
@@ -257,7 +259,7 @@ fn edged_button(action: UiAction, base: Color, edge: Color) -> impl Bundle {
     )
 }
 
-fn icon(spell: u32, size: f32) -> impl Bundle {
+pub(super) fn icon(spell: u32, size: f32) -> impl Bundle {
     (
         Node {
             width: Val::Px(size),
@@ -410,7 +412,12 @@ pub(super) fn setup_hud(
                 },
             ))
             .with_children(|col| {
-                col.spawn(centered(f, "F", 18.0, Color::WHITE));
+                let binding = if cfg!(target_os = "android") {
+                    "Skill"
+                } else {
+                    "F"
+                };
+                col.spawn(centered(f, binding, 18.0, Color::WHITE));
                 col.spawn((
                     Node {
                         width: Val::Px(MOBILITY_SIZE),
@@ -816,6 +823,7 @@ pub(super) fn setup_hud(
                 }
             });
             root.spawn((OverStats, centered(f, "", 15.0, DIM)));
+            root.spawn((OverReward, centered(f, "", 22.0, GOLD)));
             root.spawn((
                 edged_button(UiAction::MainMenu, BUTTON, GOLD),
                 Node {
@@ -895,7 +903,11 @@ pub(super) fn menu_preview(
     );
 }
 
-pub(super) fn start_run(run: &mut Run, selection: &mut Selection) -> bool {
+pub(super) fn start_run(
+    run: &mut Run,
+    selection: &mut Selection,
+    progress: &perks::Progress,
+) -> bool {
     let (Some(class), Some(&(_, race, _))) = (
         selection.class_def(),
         selection.look.and_then(|i| selection.looks.get(i)),
@@ -909,6 +921,7 @@ pub(super) fn start_run(run: &mut Run, selection: &mut Selection) -> bool {
         class,
         race,
         next_guid,
+        passives: progress.starting_passives(),
         ..Run::default()
     };
     run.abilities.push(Owned {
@@ -1050,13 +1063,21 @@ pub(super) fn buttons(
 pub(super) fn keys(
     keys: Res<ButtonInput<KeyCode>>,
     phase: Res<State<Phase>>,
+    progress: Res<perks::Progress>,
+    mut shop: ResMut<perk_shop::Shop>,
     mut selection: ResMut<Selection>,
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
 ) {
     match phase.get() {
         Phase::Menu => {
-            if keys.just_pressed(KeyCode::Enter) && start_run(&mut run, &mut selection) {
+            if shop.open {
+                if keys.just_pressed(KeyCode::Escape) {
+                    shop.close();
+                }
+            } else if keys.just_pressed(KeyCode::Enter)
+                && start_run(&mut run, &mut selection, &progress)
+            {
                 next.set(Phase::Playing);
             }
         }
@@ -1286,8 +1307,13 @@ pub(super) fn refresh_hud(
     if let Ok(mut t) = texts.p4().single_mut() {
         **t = title;
     }
+    let prompt = if cfg!(target_os = "android") {
+        "Tap Play again"
+    } else {
+        "Press Enter to play again"
+    };
     let summary = format!(
-        "{} {} in {}   —   press Enter to play again",
+        "{} {} in {}   —   {prompt}",
         crate::char_select::race_name(run.race),
         run.class.name,
         selection.map_def().name,
@@ -1650,6 +1676,7 @@ pub(super) fn refresh_results(
     mut over_texts: ParamSet<(
         Query<(&OverStat, &mut Text)>,
         Query<&mut Text, With<OverLine>>,
+        Query<&mut Text, With<OverReward>>,
     )>,
 ) {
     let secs = run.elapsed as u32;
@@ -1675,6 +1702,16 @@ pub(super) fn refresh_results(
     if let Ok(mut t) = over_texts.p1().single_mut() {
         if **t != stats_line {
             **t = stats_line.to_string();
+        }
+    }
+    if let Ok(mut text) = over_texts.p2().single_mut() {
+        let message = match run.passive_reward {
+            Some(Ok(points)) => format!("+{points} passive points"),
+            Some(Err(message)) => message.to_owned(),
+            None => String::new(),
+        };
+        if **text != message {
+            **text = message;
         }
     }
 }
@@ -1947,7 +1984,7 @@ fn stat_label(stat: Stat) -> &'static str {
     }
 }
 
-fn passive_text(stat: Stat, v: f32) -> String {
+pub(super) fn passive_text(stat: Stat, v: f32) -> String {
     match stat {
         Stat::Might => format!("Increases all damage you deal by {}.", pct(v)),
         Stat::MaxHp => format!("Increases your maximum health by {}.", pct(v)),

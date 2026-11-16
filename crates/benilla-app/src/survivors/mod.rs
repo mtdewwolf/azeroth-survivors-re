@@ -14,8 +14,14 @@ mod grade;
 mod hero;
 mod hud;
 mod menu;
+#[cfg(target_os = "android")]
+mod menu_touch;
 mod minimap;
 mod mobility;
+mod perk_shop;
+mod perks;
+#[cfg(target_os = "android")]
+mod touch;
 mod units;
 
 use benilla_world::schedule::WorldStage;
@@ -44,6 +50,9 @@ impl Plugin for SurvivorsPlugin {
             .init_resource::<Rng>()
             .init_resource::<Selection>()
             .init_resource::<Run>()
+            .init_resource::<perks::Progress>()
+            .init_resource::<perk_shop::Shop>()
+            .add_systems(Startup, perks::load)
             .init_resource::<hero::CamRig>()
             .init_resource::<hero::AimPoint>()
             .init_resource::<abilities::PendingHits>()
@@ -103,6 +112,7 @@ impl Plugin for SurvivorsPlugin {
                     menu::build_menu,
                     menu::menu_clicks,
                     menu::refresh_menu_ui.before(crate::glue::GlueVisuals),
+                    perk_shop::refresh.run_if(in_state(Phase::Menu)),
                     cards::deal_cards,
                     cards::choose_card,
                     cards::animate_cards,
@@ -134,8 +144,12 @@ impl Plugin for SurvivorsPlugin {
             .add_systems(OnEnter(Phase::Playing), unpause)
             .add_systems(OnEnter(Phase::LevelUp), (pause, hud::roll_offer))
             .add_systems(OnEnter(Phase::Paused), pause)
-            .add_systems(OnEnter(Phase::GameOver), unpause)
+            .add_systems(OnEnter(Phase::GameOver), (unpause, perks::award))
             .add_systems(OnEnter(Phase::Menu), (unpause, reset_run));
+        #[cfg(target_os = "android")]
+        app.add_plugins(touch::plugin)
+            .init_resource::<menu_touch::MenuTouch>()
+            .add_systems(PreUpdate, menu_touch::read_menu_taps);
         if let Some(auto) = auto::from_env() {
             app.insert_resource(auto)
                 .add_systems(
@@ -269,6 +283,7 @@ pub(super) struct Run {
     pub dead_t: Option<f32>,
     pub next_guid: u64,
     pub damage_done: f64,
+    pub passive_reward: Option<Result<u32, &'static str>>,
     /// Bumped whenever abilities or passives change, so the HUD rebuilds the icon rows once.
     pub version: u32,
     /// A centre-screen announcement and its seconds left.
@@ -303,6 +318,7 @@ impl Default for Run {
             dead_t: None,
             next_guid: 1,
             damage_done: 0.0,
+            passive_reward: None,
             version: 0,
             banner: None,
         }
