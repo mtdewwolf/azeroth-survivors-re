@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy::ui_render::ui_material::MaterialNode;
 
 use super::hud::{looks_for, rgb, start_run, HudFont, MenuRoot};
-use super::{data, Phase, Rng, Run, Selection};
+use super::{data, perk_shop, perks, Phase, Rng, Run, Selection};
 use crate::char_select::race_name;
 use crate::glue::art::{class_tc, race_tc, tc_rect, GlueArt, DIM, GOLD, NAME_EDGE};
 use crate::glue::backdrop::{backdrop_border, tiled_bg_node};
@@ -45,6 +45,10 @@ pub(super) enum MenuAction {
     Map(usize),
     Randomize,
     Enter,
+    OpenPassives,
+    ClosePassives,
+    BuyPassive(usize),
+    EquipPassive(usize),
 }
 
 /// On [`MenuRoot`] once the glue art is in and the screen is built.
@@ -147,63 +151,77 @@ pub(super) fn build_menu(
     let Some(mut assets) = assets else { return };
     art.ensure_loaded(&mut assets, &mut images, &mut add_mats);
     let f = &font.0;
-    commands.entity(root).insert(MenuBuilt).with_children(|ui| {
-        tower(ui, &art, f);
-        // `CharacterCreateWoWLogo`, 256×128 at TOPLEFT (3,-7), after the tower so it draws over
-        // the border art, as the create screen orders it.
-        if let Some(logo) = &art.logo {
-            ui.spawn((
-                ImageNode::new(logo.clone()),
-                abs(1.0, 3.0, 7.0, 256.0, 128.0),
-            ));
-        }
-        zone_frame(ui, &art, f);
+    commands
+        .entity(root)
+        .insert(MenuBuilt)
+        .with_children(|root| {
+            root.spawn((
+                perk_shop::Panel::Picker,
+                perk_shop::full_panel(),
+                bevy::ui::FocusPolicy::Pass,
+            ))
+            .with_children(|ui| picker(ui, &art, f));
+            perk_shop::build(root, f);
+        });
+}
 
-        // `CharSelectCharacterName`, GlueFontNormalHuge at BOTTOM (0,100).
-        ui.spawn(Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(100.0),
-            width: Val::Percent(100.0),
-            justify_content: JustifyContent::Center,
-            ..default()
-        })
-        .with_children(|c| {
-            outlined_text(
-                c,
-                Node::default(),
-                (),
-                PickName,
-                GlueText {
-                    text: "",
-                    size: 22.0,
-                    color: GOLD,
-                    wrap: false,
-                },
-                f,
-                1.0,
-            );
-        });
-        // `CharSelectEnterWorldButton`, 200×60 at BOTTOM (0,30).
-        ui.spawn(Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(30.0),
-            width: Val::Percent(100.0),
-            justify_content: JustifyContent::Center,
-            ..default()
-        })
-        .with_children(|c| {
-            glue_button(
-                c,
-                &art,
-                f,
-                MenuAction::Enter,
-                "Enter World",
-                200.0,
-                60.0,
-                GlueBtnKind::Normal,
-                1.0,
-            );
-        });
+fn picker(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
+    tower(ui, art, f);
+    // `CharacterCreateWoWLogo`, 256×128 at TOPLEFT (3,-7), after the tower so it draws over
+    // the border art, as the create screen orders it.
+    if let Some(logo) = &art.logo {
+        ui.spawn((
+            ImageNode::new(logo.clone()),
+            abs(1.0, 3.0, 7.0, 256.0, 128.0),
+        ));
+    }
+    zone_frame(ui, art, f);
+    perk_shop::launcher(ui, f);
+
+    // `CharSelectCharacterName`, GlueFontNormalHuge at BOTTOM (0,100).
+    ui.spawn(Node {
+        position_type: PositionType::Absolute,
+        bottom: Val::Px(100.0),
+        width: Val::Percent(100.0),
+        justify_content: JustifyContent::Center,
+        ..default()
+    })
+    .with_children(|c| {
+        outlined_text(
+            c,
+            Node::default(),
+            (),
+            PickName,
+            GlueText {
+                text: "",
+                size: 22.0,
+                color: GOLD,
+                wrap: false,
+            },
+            f,
+            1.0,
+        );
+    });
+    // `CharSelectEnterWorldButton`, 200×60 at BOTTOM (0,30).
+    ui.spawn(Node {
+        position_type: PositionType::Absolute,
+        bottom: Val::Px(30.0),
+        width: Val::Percent(100.0),
+        justify_content: JustifyContent::Center,
+        ..default()
+    })
+    .with_children(|c| {
+        glue_button(
+            c,
+            art,
+            f,
+            MenuAction::Enter,
+            "Enter World",
+            200.0,
+            60.0,
+            GlueBtnKind::Normal,
+            1.0,
+        );
     });
 }
 
@@ -521,6 +539,10 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn menu_clicks(
     clicks: Res<GlueClicks>,
+    #[cfg(target_os = "android")] touch: Res<super::menu_touch::MenuTouch>,
+    #[cfg(target_os = "android")] mouse: Res<ButtonInput<MouseButton>>,
+    mut shop: ResMut<perk_shop::Shop>,
+    mut progress: ResMut<perks::Progress>,
     actions: Query<(Entity, &MenuAction)>,
     phase: Res<State<Phase>>,
     creatures: Option<Res<crate::entities::Creatures>>,
@@ -532,14 +554,24 @@ pub(super) fn menu_clicks(
     if *phase.get() != Phase::Menu {
         return;
     }
-    let Some(creatures) = creatures.as_deref() else {
+    let mouse_action = || actions.iter().find(|(entity, _)| clicks.hit(*entity));
+    #[cfg(target_os = "android")]
+    let picked = touch
+        .clicked
+        .and_then(|entity| actions.get(entity).ok())
+        .or_else(|| {
+            mouse
+                .just_released(MouseButton::Left)
+                .then(mouse_action)
+                .flatten()
+        });
+    #[cfg(not(target_os = "android"))]
+    let picked = mouse_action();
+    let Some((_, &action)) = picked else { return };
+    if shop.handle(&mut progress, action) {
         return;
-    };
-    let Some(action) = actions
-        .iter()
-        .find(|(e, _)| clicks.hit(*e))
-        .map(|(_, a)| *a)
-    else {
+    }
+    let Some(creatures) = creatures.as_deref() else {
         return;
     };
     let all = all_looks(creatures);
@@ -556,7 +588,7 @@ pub(super) fn menu_clicks(
             }
         }
         MenuAction::Enter => {
-            if start_run(&mut run, &mut selection) {
+            if start_run(&mut run, &mut selection, &progress) {
                 next.set(Phase::Playing);
             }
         }
@@ -600,6 +632,10 @@ pub(super) fn menu_clicks(
                 }
             }
         }
+        MenuAction::OpenPassives
+        | MenuAction::ClosePassives
+        | MenuAction::BuyPassive(_)
+        | MenuAction::EquipPassive(_) => return,
     }
     save_pick(&selection);
 }
@@ -645,7 +681,7 @@ pub(super) fn refresh_menu_ui(
             MenuAction::Sex(s) => cur.is_some_and(|c| c.1 == s),
             MenuAction::Class(i) => selection.class == Some(i),
             MenuAction::Map(i) => selection.map == i,
-            MenuAction::Randomize | MenuAction::Enter => false,
+            _ => false,
         };
         if let Some(mut lock) = lock {
             if lock.0 != selected {

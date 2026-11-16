@@ -156,6 +156,8 @@ pub(super) fn drive(
     mut commands: Commands,
     time: Res<Time<Real>>,
     mut auto: ResMut<Auto>,
+    progress: Res<super::perks::Progress>,
+    shop: Res<super::perk_shop::Shop>,
     phase: Res<State<Phase>>,
     mut next: ResMut<NextState<Phase>>,
     mut selection: ResMut<Selection>,
@@ -171,6 +173,9 @@ pub(super) fn drive(
     auto.frames += 1;
     match phase.get() {
         Phase::Menu => {
+            if shop.open {
+                return;
+            }
             if selection.map != auto.map {
                 selection.map = auto.map;
                 selection.version += 1;
@@ -185,7 +190,7 @@ pub(super) fn drive(
                 auto.wait = 0.0;
             } else if auto.wait > 2.0 && auto.wait < 3.0 {
                 auto.capture_once(&mut commands, "menu".into());
-            } else if auto.wait > 3.0 && hud::start_run(&mut run, &mut selection) {
+            } else if auto.wait > 3.0 && hud::start_run(&mut run, &mut selection, &progress) {
                 info!(
                     "survivors auto: run begins as {} at {}",
                     run.class.name,

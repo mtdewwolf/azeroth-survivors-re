@@ -174,6 +174,7 @@ impl Run {
 pub(super) fn cast_mobility(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    #[cfg(target_os = "android")] touch: Res<super::touch::TouchControls>,
     phase: Res<State<Phase>>,
     mut run: ResMut<Run>,
     world: WorldPoint,
@@ -188,7 +189,10 @@ pub(super) fn cast_mobility(
     m.cd = (m.cd - dt).max(0.0);
     m.haste_t = (m.haste_t - dt).max(0.0);
     m.vanish_t = (m.vanish_t - dt).max(0.0);
-    if *phase.get() != Phase::Playing || run.dead_t.is_some() || !keys.just_pressed(KEY) {
+    let cast = keys.just_pressed(KEY);
+    #[cfg(target_os = "android")]
+    let cast = cast || touch.mobility;
+    if *phase.get() != Phase::Playing || run.dead_t.is_some() || !cast {
         return;
     }
     let Some(def) = run.mobility() else { return };
@@ -203,6 +207,14 @@ pub(super) fn cast_mobility(
     let facing = flat(facing).normalize_or(Vec3::NEG_Z);
     // Aimed at the cursor where there is one, else straight ahead.
     let cursor = aim.0.filter(|a| flat(*a - pos).length() > 0.5);
+    #[cfg(target_os = "android")]
+    let cursor = if touch.mobility {
+        Vec3::new(touch.direction.x, 0.0, touch.direction.y)
+            .try_normalize()
+            .map(|direction| pos + direction * 100.0)
+    } else {
+        cursor
+    };
     let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
     // Keep any jump inside the battleground's leash.
     let map = selection.map_def();

@@ -195,6 +195,7 @@ pub(super) fn drive_hero(
     aim: Res<AimPoint>,
     world: WorldPoint,
     auto: Option<Res<super::auto::Auto>>,
+    #[cfg(target_os = "android")] touch: Res<super::touch::TouchControls>,
     mut player: ResMut<crate::player::Player>,
     mut hero: Query<(&mut Transform, &mut MovementState, &mut Hero)>,
 ) {
@@ -220,6 +221,10 @@ pub(super) fn drive_hero(
                 if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
                     dir.x += 1.0;
                 }
+                #[cfg(target_os = "android")]
+                if touch.direction != Vec2::ZERO {
+                    dir = Vec3::new(touch.direction.x, 0.0, touch.direction.y);
+                }
                 // In orbit mode WASD is camera-relative; in fixed mode it stays world-relative.
                 if rig.mode == CamMode::Orbit {
                     let (sy, cy) = rig.yaw.sin_cos();
@@ -237,6 +242,8 @@ pub(super) fn drive_hero(
             .flatten()
             .filter(|d| d.length() > 0.5)
             .map(|d| d.normalize());
+            #[cfg(target_os = "android")]
+            let face = face.filter(|_| touch.direction == Vec2::ZERO);
             if let Some(look) = face {
                 let target = Quat::from_rotation_y(yaw_toward(look));
                 tf.rotation = tf.rotation.slerp(target, (dt * 20.0).min(1.0));
@@ -244,6 +251,12 @@ pub(super) fn drive_hero(
             if dir != Vec3::ZERO && dt > 0.0 {
                 let dir = dir.normalize();
                 let speed = run.stats().speed * run.haste_mult();
+                #[cfg(target_os = "android")]
+                let speed = if auto.is_none() && touch.direction != Vec2::ZERO {
+                    speed * touch.direction.length().min(1.0)
+                } else {
+                    speed
+                };
                 pos += dir * speed * dt;
                 mv.speed = speed;
                 mv.flags = match face {
@@ -272,7 +285,10 @@ pub(super) fn drive_hero(
             let ground = world.terrain_height_under(pos).unwrap_or(pos.y);
             let playing = *phase.get() == Phase::Playing && run.dead_t.is_none();
             // Space hops: lift off the terrain, then gravity brings the hero back down.
-            if playing && keys.just_pressed(KeyCode::Space) && hm.vy == 0.0 && hm.air == 0.0 {
+            let jump = keys.just_pressed(KeyCode::Space);
+            #[cfg(target_os = "android")]
+            let jump = jump || touch.jump;
+            if playing && jump && hm.vy == 0.0 && hm.air == 0.0 {
                 hm.vy = JUMP_SPEED;
             }
             if playing && (hm.vy != 0.0 || hm.air > 0.0) {
@@ -338,6 +354,7 @@ pub(super) fn place_camera(
     mut wheel: MessageReader<MouseWheel>,
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
+    #[cfg(target_os = "android")] touch: Res<super::touch::TouchControls>,
     keys: Res<ButtonInput<KeyCode>>,
     player: Res<crate::player::Player>,
     world: WorldPoint,
@@ -366,6 +383,10 @@ pub(super) fn place_camera(
             MouseScrollUnit::Pixel => w.y * 0.02,
         };
         rig.dist = (rig.dist * (1.0 - 0.12 * notches).clamp(0.5, 1.5)).clamp(ZOOM_MIN, ZOOM_MAX);
+    }
+    #[cfg(target_os = "android")]
+    if touch.zoom != 0.0 {
+        rig.dist = (rig.dist * (1.0 - 0.12 * touch.zoom).clamp(0.5, 1.5)).clamp(ZOOM_MIN, ZOOM_MAX);
     }
     let (eye, look) = if *phase.get() == Phase::Menu {
         rig.orbit += time.delta_secs() * 0.2;
