@@ -88,6 +88,7 @@ fn spell_tier(def: &data::AbilityDef, run: &Run) -> Rarity {
         return Rarity::Rare;
     };
     let mut all: Vec<f32> = run
+        .local()
         .class
         .pool
         .iter()
@@ -107,10 +108,11 @@ fn spell_tier(def: &data::AbilityDef, run: &Run) -> Rarity {
 /// What a choice is worth, by what it brings: a top rank is Legendary, a rank that adds a target
 /// Epic, a new spell by its power among the class's ([`spell_tier`]), a plain rank Uncommon.
 pub(super) fn rarity(choice: Choice, run: &Run) -> Rarity {
+    let player = run.local();
     match choice {
         Choice::NewAbility(def) => spell_tier(def, run),
         Choice::Upgrade(k) => {
-            let o = &run.abilities[k];
+            let o = &player.abilities[k];
             let next = o.level + 1;
             let targets = [3, 5, 7].contains(&next)
                 && matches!(
@@ -126,7 +128,7 @@ pub(super) fn rarity(choice: Choice, run: &Run) -> Rarity {
             }
         }
         Choice::NewPassive(_) => Rarity::Uncommon,
-        Choice::UpPassive(k) => match run.passives[k].1 + 1 {
+        Choice::UpPassive(k) => match player.passives[k].1 + 1 {
             n if n == data::MAX_PASSIVE_LEVEL => Rarity::Epic,
             n if n + 1 == data::MAX_PASSIVE_LEVEL => Rarity::Rare,
             2 => Rarity::Common,

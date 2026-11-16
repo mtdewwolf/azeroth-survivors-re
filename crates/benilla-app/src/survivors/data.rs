@@ -2018,3 +2018,279 @@ fn ladder(foes: &[Foe], tuned: &[EnemyDef]) -> Vec<EnemyDef> {
         })
         .collect()
 }
+
+/// Difficulty tier selected for a run; clearing a zone unlocks higher tiers for that zone.
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub(crate) enum DifficultyTier {
+    #[default]
+    Normal,
+    Heroic,
+    Mythic,
+}
+
+impl DifficultyTier {
+    pub(crate) const ALL: [DifficultyTier; 3] = [Self::Normal, Self::Heroic, Self::Mythic];
+
+    /// Numeric rank stored in save files (`0` = uncleared, `1` = Normal, `2` = Heroic, `3` = Mythic).
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Normal => 1,
+            Self::Heroic => 2,
+            Self::Mythic => 3,
+        }
+    }
+
+    pub(crate) const fn from_rank(rank: u8) -> Option<Self> {
+        match rank {
+            1 => Some(Self::Normal),
+            2 => Some(Self::Heroic),
+            3 => Some(Self::Mythic),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Heroic => "Heroic",
+            Self::Mythic => "Mythic",
+        }
+    }
+
+    pub(crate) const fn hp_mult(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Heroic => 1.65,
+            Self::Mythic => 2.6,
+        }
+    }
+
+    pub(crate) const fn damage_mult(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Heroic => 1.45,
+            Self::Mythic => 2.1,
+        }
+    }
+
+    pub(crate) const fn speed_mult(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Heroic => 1.08,
+            Self::Mythic => 1.18,
+        }
+    }
+
+    pub(crate) const fn xp_mult(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Heroic => 1.25,
+            Self::Mythic => 1.55,
+        }
+    }
+
+    pub(crate) const fn reward_mult(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Heroic => 1.5,
+            Self::Mythic => 2.2,
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Normal => 0,
+            Self::Heroic => 1,
+            Self::Mythic => 2,
+        }
+    }
+
+    pub(crate) const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Heroic,
+            2 => Self::Mythic,
+            _ => Self::Normal,
+        }
+    }
+}
+
+pub(crate) const STARTER_ZONES: &[&str] = &[
+    "The Barrens",
+    "Elwynn Forest",
+    "Teldrassil",
+    "Mulgore",
+    "Durotar",
+    "Dun Morogh",
+    "Tirisfal Glades",
+];
+
+pub(crate) fn map_key(map: &MapDef) -> &'static str {
+    map.name
+}
+
+pub(crate) fn map_index_by_key(key: &str) -> Option<usize> {
+    MAPS.iter().position(|m| m.name.eq_ignore_ascii_case(key))
+}
+
+pub(crate) fn class_by_id(id: u8) -> Option<(usize, &'static ClassDef)> {
+    CLASSES.iter().enumerate().find(|(_, c)| c.id == id)
+}
+
+pub(crate) fn is_starter_zone(name: &str) -> bool {
+    STARTER_ZONES.iter().any(|&z| z.eq_ignore_ascii_case(name))
+}
+
+/// Zones where clearing ANY listed zone unlocks `name`. Empty means unlocked from the start.
+fn unlock_any_of(name: &str) -> (&'static [&'static str], &'static str) {
+    match name {
+        "Westfall" => (STARTER_ZONES, "Clear any starter zone"),
+        "Redridge Mountains" => (&["Westfall"], "Clear Westfall"),
+        "Duskwood" => (&["Redridge Mountains"], "Clear Redridge Mountains"),
+        "Gurubashi Arena" => (&["Duskwood"], "Clear Duskwood"),
+        "The Dark Portal" => (&["Gurubashi Arena"], "Clear Gurubashi Arena"),
+        "Fire Plume Ridge" => (&["The Dark Portal"], "Clear The Dark Portal"),
+        "Naxxramas" => (&["Fire Plume Ridge"], "Clear Fire Plume Ridge"),
+        "Gates of Ahn'Qiraj" => (&["Naxxramas"], "Clear Naxxramas"),
+        "Mount Hyjal" => (&["Gates of Ahn'Qiraj"], "Clear Gates of Ahn'Qiraj"),
+        _ => (&[], ""),
+    }
+}
+
+pub(crate) fn is_zone_unlocked(
+    name: &str,
+    cleared: &std::collections::BTreeMap<String, u8>,
+) -> bool {
+    if is_starter_zone(name) {
+        return true;
+    }
+    let (prereqs, _) = unlock_any_of(name);
+    if prereqs.is_empty() {
+        return true;
+    }
+    prereqs
+        .iter()
+        .any(|&req| cleared.get(req).copied().unwrap_or(0) >= DifficultyTier::Normal.rank())
+}
+
+pub(crate) fn zone_unlock_hint(name: &str) -> Option<&'static str> {
+    if is_starter_zone(name) {
+        return None;
+    }
+    let (prereqs, hint) = unlock_any_of(name);
+    (!prereqs.is_empty() && !hint.is_empty()).then_some(hint)
+}
+
+pub(crate) fn is_tier_unlocked(
+    map_name: &str,
+    tier: DifficultyTier,
+    cleared: &std::collections::BTreeMap<String, u8>,
+) -> bool {
+    if !is_zone_unlocked(map_name, cleared) {
+        return false;
+    }
+    let best = cleared.get(map_name).copied().unwrap_or(0);
+    match tier {
+        DifficultyTier::Normal => true,
+        DifficultyTier::Heroic => best >= DifficultyTier::Normal.rank(),
+        DifficultyTier::Mythic => best >= DifficultyTier::Heroic.rank(),
+    }
+}
+
+pub(crate) fn tier_unlock_hint(tier: DifficultyTier) -> &'static str {
+    match tier {
+        DifficultyTier::Normal => "Unlocked with zone",
+        DifficultyTier::Heroic => "Clear Normal first",
+        DifficultyTier::Mythic => "Clear Heroic first",
+    }
+}
+
+pub(crate) fn zone_reward_mult(map_index: usize) -> f32 {
+    let name = MAPS[map_index.min(MAPS.len() - 1)].name;
+    match name {
+        "Westfall" | "Redridge Mountains" | "Duskwood" => 1.2,
+        "Gurubashi Arena" | "The Dark Portal" | "Fire Plume Ridge" => 1.4,
+        "Naxxramas" | "Gates of Ahn'Qiraj" | "Mount Hyjal" => 1.65,
+        _ => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn zone_and_tier_unlock_chain_covers_all_maps() {
+        let mut cleared = BTreeMap::new();
+        for m in MAPS {
+            if is_starter_zone(m.name) {
+                assert!(is_zone_unlocked(m.name, &cleared));
+                assert!(is_tier_unlocked(m.name, DifficultyTier::Normal, &cleared));
+                assert!(!is_tier_unlocked(m.name, DifficultyTier::Heroic, &cleared));
+                assert!(!is_tier_unlocked(m.name, DifficultyTier::Mythic, &cleared));
+            } else {
+                assert!(
+                    !is_zone_unlocked(m.name, &cleared),
+                    "{} should start locked",
+                    m.name
+                );
+                assert!(zone_unlock_hint(m.name).is_some());
+            }
+        }
+
+        // Clearing a starter zone unlocks Westfall and Heroic for that starter zone.
+        cleared.insert("The Barrens".into(), DifficultyTier::Normal.rank());
+        assert!(is_tier_unlocked(
+            "The Barrens",
+            DifficultyTier::Heroic,
+            &cleared
+        ));
+        assert!(!is_tier_unlocked(
+            "The Barrens",
+            DifficultyTier::Mythic,
+            &cleared
+        ));
+        assert!(is_zone_unlocked("Westfall", &cleared));
+        assert!(!is_zone_unlocked("Redridge Mountains", &cleared));
+
+        // Walk the full chapter chain through Mount Hyjal.
+        for zone in [
+            "Westfall",
+            "Redridge Mountains",
+            "Duskwood",
+            "Gurubashi Arena",
+            "The Dark Portal",
+            "Fire Plume Ridge",
+            "Naxxramas",
+            "Gates of Ahn'Qiraj",
+        ] {
+            assert!(is_zone_unlocked(zone, &cleared), "{zone} should unlock");
+            cleared.insert(zone.into(), DifficultyTier::Normal.rank());
+        }
+        assert!(is_zone_unlocked("Mount Hyjal", &cleared));
+    }
+
+    #[test]
+    fn difficulty_tiers_scale_monotonically() {
+        for pair in DifficultyTier::ALL.windows(2) {
+            let [a, b] = [pair[0], pair[1]];
+            assert!(b.hp_mult() > a.hp_mult());
+            assert!(b.damage_mult() > a.damage_mult());
+            assert!(b.speed_mult() > a.speed_mult());
+            assert!(b.xp_mult() > a.xp_mult());
+            assert!(b.reward_mult() > a.reward_mult());
+        }
+    }
+}

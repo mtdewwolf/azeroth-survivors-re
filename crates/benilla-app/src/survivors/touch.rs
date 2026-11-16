@@ -140,7 +140,8 @@ fn read_touches(
     touch.mobility = false;
     touch.zoom = 0.0;
     let lost_focus = focus.read().any(|event| !event.focused);
-    let active = *phase.get() == Phase::Playing && !loading.covering() && run.dead_t.is_none();
+    let active =
+        *phase.get() == Phase::Playing && !loading.covering() && run.local().dead_t.is_none();
     for mut root in &mut roots {
         let display = if active { Display::Flex } else { Display::None };
         if root.display != display {

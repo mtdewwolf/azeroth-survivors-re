@@ -1,21 +1,26 @@
 //! The run's pick screen, laid out like the 1.12 character create and select glue screens and built
 //! from their own widgets and art ([`crate::glue`]): the race, gender and class tower on the left,
-//! the zone list in the character-select frame on the right, Enter World at the bottom.
+//! the zone list + difficulty tier selector on the right, character roster + passive upgrades at
+//! bottom-left, and Enter World at the bottom center.
 //!
 //! The survivors HUD lays out on the 768-unit canvas through `UiScale`, so every glue builder here
 //! takes a unit scale.
 
+use benilla_ui::widget::EditBoxState;
+use bevy::input::keyboard::KeyboardInput;
+use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::ui::FocusPolicy;
 use bevy::ui_render::ui_material::MaterialNode;
 
-use super::hud::{looks_for, rgb, start_run, HudFont, MenuRoot};
+use super::hud::{centered_bundle, looks_for, rgb, start_run, text_bundle, HudFont, MenuRoot};
 use super::{data, perk_shop, perks, Phase, Rng, Run, Selection};
 use crate::char_select::race_name;
 use crate::glue::art::{class_tc, race_tc, tc_rect, GlueArt, DIM, GOLD, NAME_EDGE};
 use crate::glue::backdrop::{backdrop_border, tiled_bg_node};
 use crate::glue::widgets::{
-    abs, glue_button, icon_button, outlined_text, GlueBtnKind, GlueDisabled, GlueText, Hilight,
-    HoverLabel, LockHighlight,
+    abs, glue_button, glue_edit_box, icon_button, outlined_text, paint_glue_field, GlueBtnKind,
+    GlueDisabled, GlueFieldPart, GlueText, Hilight, HoverLabel, LockHighlight,
 };
 use crate::glue::GlueClicks;
 
@@ -27,15 +32,25 @@ const HORDE: [u8; 4] = [2, 5, 6, 8];
 const FRAME_BORDER: Color = Color::srgb(0.8, 0.8, 0.8);
 const FRAME_FILL: Color = Color::srgba(0.09, 0.09, 0.09, 0.85);
 
-/// The tower ends under the class grid and Randomize, where the create screen's appearance dials
-/// would start: there is nothing to customise here.
-const TOWER_H: f32 = 590.0;
+/// Character roster overlay palette (matching `perk_shop`).
+const ROSTER_BG: Color = Color::srgba(0.038, 0.027, 0.020, 0.97);
+const ROSTER_CARD: Color = Color::srgb(0.105, 0.073, 0.048);
+const ROSTER_ACTIVE_CARD: Color = Color::srgb(0.165, 0.115, 0.062);
+const ROSTER_BTN: Color = Color::srgb(0.23, 0.13, 0.069);
+const ROSTER_BTN_HOT: Color = Color::srgb(0.38, 0.22, 0.09);
+const ROSTER_BTN_OFF: Color = Color::srgb(0.14, 0.105, 0.081);
+const ROSTER_MUTED: Color = Color::srgb(0.77, 0.70, 0.61);
+const ROSTER_EDGE: Color = Color::srgb(0.44, 0.34, 0.22);
 
-/// The zone rows: the character-select row, compacted so every zone fits the 642-tall frame.
-const ROW_TOP: f32 = 44.0;
-const ROW_PITCH: f32 = 36.0;
-const ROW_H: f32 = 34.0;
-const ROW_W: f32 = 228.0;
+/// The tower ends under the class grid and Randomize.
+const TOWER_H: f32 = 580.0;
+
+/// The zone rows: compacted to fit 16 zones plus the Difficulty Tier selector cleanly inside the
+/// 768-unit canvas.
+const ROW_TOP: f32 = 36.0;
+const ROW_PITCH: f32 = 33.0;
+const ROW_H: f32 = 31.0;
+const ROW_W: f32 = 234.0;
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MenuAction {
@@ -43,12 +58,56 @@ pub(super) enum MenuAction {
     Sex(u8),
     Class(usize),
     Map(usize),
+    Tier(usize),
     Randomize,
     Enter,
     OpenPassives,
     ClosePassives,
     BuyPassive(usize),
     EquipPassive(usize),
+    RespecPassives,
+    OpenCharacters,
+    CloseCharacters,
+    SelectCharacter(usize),
+    CreateCharacter,
+    RenameCharacter,
+    RandomCharacterName,
+    DeleteCharacter(usize),
+}
+
+/// Modal state for the Character Roster overlay.
+#[derive(Resource)]
+pub(super) struct RosterUi {
+    pub(super) open: bool,
+    pub(super) name_box: EditBoxState,
+    pub(super) feedback: String,
+    pub(super) confirm_delete: Option<u32>,
+}
+
+impl Default for RosterUi {
+    fn default() -> Self {
+        Self {
+            open: false,
+            name_box: crate::textinput::field(perks::MAX_NAME_LEN, false),
+            feedback: String::new(),
+            confirm_delete: None,
+        }
+    }
+}
+
+impl RosterUi {
+    pub(super) fn open_with(&mut self, active_name: &str) {
+        self.open = true;
+        self.feedback.clear();
+        self.confirm_delete = None;
+        self.name_box.set_text(active_name);
+    }
+
+    pub(super) fn close(&mut self) {
+        self.open = false;
+        self.feedback.clear();
+        self.confirm_delete = None;
+    }
 }
 
 /// On [`MenuRoot`] once the glue art is in and the screen is built.
@@ -62,27 +121,97 @@ pub(super) struct RaceFace(u8);
 #[derive(Component)]
 pub(super) struct PickName;
 
-/// The saved pick, `benilla-config/survivors-pick.txt` (`localStorage` on the page):
-/// `class race sex map`, restored at the menu so a reload keeps the last hero and zone.
-fn pick_path() -> Option<std::path::PathBuf> {
-    crate::local_state::home().map(|h| h.join("survivors-pick.txt"))
+#[derive(Component)]
+pub(super) struct PickSub;
+
+#[derive(Component)]
+pub(super) struct ZoneTitle(usize);
+
+#[derive(Component)]
+pub(super) struct ZoneSub(usize);
+
+#[derive(Component)]
+pub(super) struct TierHint;
+
+#[derive(Component)]
+pub(super) struct HeroLauncherLabel;
+
+#[derive(Component, Clone, Copy)]
+pub(super) struct RosterNameField;
+
+#[derive(Component)]
+pub(super) struct RosterRow(usize);
+
+#[derive(Component)]
+pub(super) struct RosterBtn;
+
+#[derive(Component)]
+pub(super) enum RosterCaption {
+    SlotCount,
+    Feedback,
+    SlotName(usize),
+    SlotInfo(usize),
+    SlotSelect(usize),
+    SlotDelete(usize),
 }
 
-fn save_pick(sel: &Selection) {
-    let (Some(class), Some(&(_, race, sex))) = (sel.class, sel.look.and_then(|i| sel.looks.get(i)))
-    else {
-        return;
+fn zone_level_bounds(map_index: usize) -> (u32, u32) {
+    let levels = data::roster(map_index).enemies.iter().map(|e| e.level);
+    let lo = levels.clone().min().unwrap_or(1);
+    let hi = levels.max().unwrap_or(lo);
+    (lo, hi)
+}
+
+fn apply_slot_to_selection(
+    slot: &perks::CharacterSlot,
+    progress: &perks::Progress,
+    creatures: Option<&crate::entities::Creatures>,
+    selection: &mut Selection,
+) {
+    let map = data::map_index_by_key(&slot.last_zone)
+        .filter(|&i| progress.is_zone_unlocked(i))
+        .unwrap_or(0);
+    selection.map = map;
+    selection.stage = map;
+    selection.tier = if progress.is_tier_unlocked(map, slot.tier) {
+        slot.tier
+    } else {
+        data::DifficultyTier::Normal
     };
-    if let Some(path) = pick_path() {
-        let _ =
-            crate::local_state::write_atomic(&path, &format!("{class} {race} {sex} {}", sel.map));
+
+    let class_idx = data::class_by_id(slot.class_id)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    if let Some(creatures) = creatures {
+        let all = all_looks(creatures);
+        let looks = &all[class_idx];
+        let look = find(looks, Some(slot.race), Some(slot.sex))
+            .or_else(|| find(looks, Some(slot.race), None))
+            .or_else(|| find(looks, None, None))
+            .unwrap_or(0);
+        set(selection, &all, class_idx, look);
+    } else {
+        selection.class = Some(class_idx);
+        selection.looks.clear();
+        selection.look = None;
+        selection.version += 1;
     }
 }
 
-/// Restore the saved pick once the creature data can resolve its looks; a stale or missing file
-/// leaves the default.
+fn sync_selection_to_progress(selection: &Selection, progress: &mut perks::Progress) {
+    let (Some(class), Some(&(_, race, sex))) = (
+        selection.class_def(),
+        selection.look.and_then(|i| selection.looks.get(i)),
+    ) else {
+        return;
+    };
+    progress.sync_active_pick(class.id, race, sex, selection.map, selection.tier);
+}
+
+/// Restore the active character slot's hero & zone once creature data can resolve looks.
 pub(super) fn restore_pick(
     creatures: Option<Res<crate::entities::Creatures>>,
+    progress: Res<perks::Progress>,
     mut selection: ResMut<Selection>,
     mut done: Local<bool>,
 ) {
@@ -93,27 +222,12 @@ pub(super) fn restore_pick(
         return;
     };
     *done = true;
-    let Some(text) = pick_path().and_then(|p| crate::local_state::read_to_string(&p).ok()) else {
-        return;
-    };
-    let v: Vec<usize> = text
-        .split_whitespace()
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    let [class, race, sex, map] = v[..] else {
-        return;
-    };
-    if map < data::MAPS.len() {
-        selection.map = map;
-        selection.stage = map;
-        selection.version += 1;
-    }
-    if class < data::CLASSES.len() {
-        let all = all_looks(creatures);
-        if let Some(l) = find(&all[class], Some(race as u8), Some(sex as u8)) {
-            set(&mut selection, &all, class, l);
-        }
-    }
+    apply_slot_to_selection(
+        progress.active_slot(),
+        &progress,
+        Some(creatures),
+        &mut selection,
+    );
 }
 
 /// Every class's looks, `(display, race, sex)`, indexed like [`data::CLASSES`].
@@ -142,6 +256,7 @@ pub(super) fn build_menu(
     mut commands: Commands,
     roots: Query<Entity, (With<MenuRoot>, Without<MenuBuilt>)>,
     assets: Option<ResMut<benilla_assets::WorldAssets>>,
+    asset_server: Option<Res<AssetServer>>,
     mut art: ResMut<GlueArt>,
     mut images: ResMut<Assets<Image>>,
     mut add_mats: ResMut<Assets<crate::glue::add_material::AddUiMaterial>>,
@@ -151,6 +266,10 @@ pub(super) fn build_menu(
     let Some(mut assets) = assets else { return };
     art.ensure_loaded(&mut assets, &mut images, &mut add_mats);
     let f = &font.0;
+    let edit_font: Handle<Font> = asset_server
+        .as_deref()
+        .map(|s| s.load("mpq://Fonts/ARIALN.ttf"))
+        .unwrap_or_else(|| f.clone());
     commands
         .entity(root)
         .insert(MenuBuilt)
@@ -158,10 +277,11 @@ pub(super) fn build_menu(
             root.spawn((
                 perk_shop::Panel::Picker,
                 perk_shop::full_panel(),
-                bevy::ui::FocusPolicy::Pass,
+                FocusPolicy::Pass,
             ))
             .with_children(|ui| picker(ui, &art, f));
             perk_shop::build(root, f);
+            build_characters_panel(root, &art, f, &edit_font);
         });
 }
 
@@ -176,7 +296,66 @@ fn picker(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
         ));
     }
     zone_frame(ui, art, f);
-    perk_shop::launcher(ui, f);
+
+    // Bottom-left launcher buttons: Character Roster + Passive Upgrades.
+    ui.spawn(Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(24.0),
+        bottom: Val::Px(12.0),
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(6.0),
+        ..default()
+    })
+    .with_children(|col| {
+        col.spawn((
+            perk_shop::ShopButton,
+            MenuAction::OpenCharacters,
+            GlueDisabled(false),
+            Button,
+            Node {
+                width: Val::Px(260.0),
+                height: Val::Px(42.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(ROSTER_BTN),
+            BorderColor::all(ROSTER_EDGE),
+        ))
+        .with_child((
+            HeroLauncherLabel,
+            centered_bundle(f, "Characters", 19.0, GOLD),
+            FocusPolicy::Pass,
+        ));
+        perk_shop::launcher_button(col, f);
+    });
+
+    // Starter-bonus & hero level summary above the hero name.
+    ui.spawn(Node {
+        position_type: PositionType::Absolute,
+        bottom: Val::Px(128.0),
+        width: Val::Percent(100.0),
+        justify_content: JustifyContent::Center,
+        ..default()
+    })
+    .with_children(|c| {
+        outlined_text(
+            c,
+            Node::default(),
+            (),
+            PickSub,
+            GlueText {
+                text: "",
+                size: 14.0,
+                color: ROSTER_MUTED,
+                wrap: false,
+            },
+            f,
+            1.0,
+        );
+    });
 
     // `CharSelectCharacterName`, GlueFontNormalHuge at BOTTOM (0,100).
     ui.spawn(Node {
@@ -225,7 +404,7 @@ fn picker(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
     });
 }
 
-/// `CharacterCreateConfigurationFrame`, 206×600 at TOPLEFT (28,-74): the race columns under the
+/// `CharacterCreateConfigurationFrame`, 206×580 at TOPLEFT (28,-74): the race columns under the
 /// faction banners, the gender pair, the class grid, the class text and Randomize.
 fn tower(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
     let px = Val::Px;
@@ -395,7 +574,7 @@ fn tower(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
             .spawn(Node {
                 position_type: PositionType::Absolute,
                 left: px(30.0),
-                top: px(TOWER_H - 46.0),
+                top: px(TOWER_H - 42.0),
                 ..default()
             })
             .with_children(|r| {
@@ -414,15 +593,13 @@ fn tower(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
     });
 }
 
-/// The zone list in `CharacterSelectCharacterFrame` (260×642 at TOPRIGHT (-5,-15)), one
-/// character-row per zone, lowest level first.
+/// The zone list + difficulty tier selector in `CharacterSelectCharacterFrame` (266×702 at
+/// TOPRIGHT (-5,-10)), lowest level zone first.
 fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
     let px = Val::Px;
     let mut order: Vec<(usize, u32, u32)> = (0..data::MAPS.len())
         .map(|i| {
-            let levels = data::roster(i).enemies.iter().map(|e| e.level);
-            let lo = levels.clone().min().unwrap_or(1);
-            let hi = levels.max().unwrap_or(lo);
+            let (lo, hi) = zone_level_bounds(i);
             (i, lo, hi)
         })
         .collect();
@@ -431,9 +608,9 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
     ui.spawn(Node {
         position_type: PositionType::Absolute,
         right: px(5.0),
-        top: px(15.0),
-        width: px(260.0),
-        height: px(642.0),
+        top: px(10.0),
+        width: px(266.0),
+        height: px(702.0),
         ..default()
     })
     .with_children(|frame| {
@@ -457,7 +634,7 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
             frame,
             Node {
                 position_type: PositionType::Absolute,
-                top: px(12.0),
+                top: px(10.0),
                 width: Val::Percent(100.0),
                 justify_content: JustifyContent::Center,
                 ..default()
@@ -466,7 +643,7 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
             (),
             GlueText {
                 text: "Choose a Zone",
-                size: 18.0,
+                size: 17.0,
                 color: DIM,
                 wrap: false,
             },
@@ -480,9 +657,10 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
                     MenuAction::Map(i),
                     Button,
                     LockHighlight::default(),
+                    GlueDisabled(false),
                     Node {
                         position_type: PositionType::Absolute,
-                        left: px(24.0),
+                        left: px(20.0),
                         top: px(ROW_TOP + row as f32 * ROW_PITCH),
                         width: px(ROW_W),
                         height: px(ROW_H),
@@ -490,22 +668,22 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
                     },
                 ))
                 .with_children(|b| {
-                    if let Some(hi) = &art.select_highlight {
+                    if let Some(hi_mat) = &art.select_highlight {
                         b.spawn((
                             Hilight,
                             Visibility::Hidden,
-                            MaterialNode(hi.clone()),
-                            abs(1.0, -20.0, -6.0, ROW_W + 20.0, ROW_H + 12.0),
+                            MaterialNode(hi_mat.clone()),
+                            abs(1.0, -16.0, -5.0, ROW_W + 16.0, ROW_H + 10.0),
                         ));
                     }
                     outlined_text(
                         b,
-                        abs(1.0, 0.0, 2.0, ROW_W, 16.0),
+                        abs(1.0, 0.0, 1.0, ROW_W, 16.0),
                         (),
-                        (),
+                        ZoneTitle(i),
                         GlueText {
                             text: map.name,
-                            size: 15.0,
+                            size: 14.0,
                             color: GOLD,
                             wrap: false,
                         },
@@ -519,12 +697,12 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
                     };
                     outlined_text(
                         b,
-                        abs(1.0, 0.0, 19.0, ROW_W, 14.0),
+                        abs(1.0, 0.0, 17.0, ROW_W, 13.0),
                         (),
-                        (),
+                        ZoneSub(i),
                         GlueText {
                             text: &format!("{levels}  {}", map.zone),
-                            size: 12.0,
+                            size: 11.0,
                             color: Color::WHITE,
                             wrap: false,
                         },
@@ -533,7 +711,339 @@ fn zone_frame(ui: &mut ChildSpawnerCommands, art: &GlueArt, f: &Handle<Font>) {
                     );
                 });
         }
+
+        // Difficulty Tier section under the 16 zones.
+        outlined_text(
+            frame,
+            abs(1.0, 16.0, 572.0, 234.0, 18.0),
+            (),
+            (),
+            GlueText {
+                text: "Difficulty Tier",
+                size: 13.0,
+                color: DIM,
+                wrap: false,
+            },
+            f,
+            1.0,
+        );
+        frame
+            .spawn(Node {
+                position_type: PositionType::Absolute,
+                left: px(16.0),
+                top: px(592.0),
+                column_gap: px(6.0),
+                flex_direction: FlexDirection::Row,
+                ..default()
+            })
+            .with_children(|row| {
+                for tier in data::DifficultyTier::ALL {
+                    let e = glue_button(
+                        row,
+                        art,
+                        f,
+                        MenuAction::Tier(tier.index()),
+                        tier.label(),
+                        74.0,
+                        32.0,
+                        GlueBtnKind::Small,
+                        1.0,
+                    );
+                    row.commands().entity(e).insert(LockHighlight::default());
+                }
+            });
+        outlined_text(
+            frame,
+            abs(1.0, 16.0, 632.0, 234.0, 56.0),
+            (),
+            TierHint,
+            GlueText {
+                text: "",
+                size: 11.0,
+                color: ROSTER_MUTED,
+                wrap: true,
+            },
+            f,
+            1.0,
+        );
     });
+}
+
+fn build_characters_panel(
+    root: &mut ChildSpawnerCommands,
+    art: &GlueArt,
+    f: &Handle<Font>,
+    edit_font: &Handle<Font>,
+) {
+    root.spawn((
+        perk_shop::Panel::Characters,
+        Node {
+            display: Display::None,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            padding: UiRect::vertical(Val::Px(12.0)),
+            ..perk_shop::full_panel()
+        },
+        Visibility::Hidden,
+        BackgroundColor(ROSTER_BG),
+    ))
+    .with_children(|panel| {
+        panel
+            .spawn(Node {
+                width: Val::Percent(92.0),
+                max_width: Val::Px(980.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
+                ..default()
+            })
+            .with_children(|body| {
+                body.spawn(Node {
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|header| {
+                    header
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            ..default()
+                        })
+                        .with_children(|title| {
+                            title.spawn(text_bundle(f, "Character Roster", 32.0, GOLD));
+                            title.spawn((
+                                RosterCaption::SlotCount,
+                                text_bundle(f, "", 18.0, ROSTER_MUTED),
+                            ));
+                        });
+                    roster_button(
+                        header,
+                        f,
+                        MenuAction::CloseCharacters,
+                        "Back",
+                        120.0,
+                        40.0,
+                        None,
+                    );
+                });
+
+                // Name box + create/rename/random toolbar (works with keyboard or touch Random).
+                body.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|bar| {
+                    bar.spawn(text_bundle(f, "Hero name:", 18.0, ROSTER_MUTED));
+                    glue_edit_box(
+                        bar,
+                        art,
+                        edit_font,
+                        (),
+                        RosterNameField,
+                        (210.0, 40.0),
+                        (Color::srgb(0.6, 0.55, 0.45), Color::srgb(0.08, 0.06, 0.05)),
+                        (12.0, 10.0, 0.0, 0.0),
+                        1.0,
+                    );
+                    roster_button(
+                        bar,
+                        f,
+                        MenuAction::RandomCharacterName,
+                        "Random",
+                        105.0,
+                        40.0,
+                        None,
+                    );
+                    roster_button(
+                        bar,
+                        f,
+                        MenuAction::CreateCharacter,
+                        "Create New",
+                        136.0,
+                        40.0,
+                        None,
+                    );
+                    roster_button(
+                        bar,
+                        f,
+                        MenuAction::RenameCharacter,
+                        "Rename Active",
+                        152.0,
+                        40.0,
+                        None,
+                    );
+                });
+
+                body.spawn((
+                    RosterCaption::Feedback,
+                    Node {
+                        min_height: Val::Px(22.0),
+                        ..default()
+                    },
+                    text_bundle(f, "", 17.0, GOLD),
+                ));
+
+                for first in (0..perks::MAX_CHARACTERS).step_by(2) {
+                    body.spawn(Node {
+                        column_gap: Val::Px(10.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        for idx in first..(first + 2).min(perks::MAX_CHARACTERS) {
+                            roster_slot_card(row, f, idx);
+                        }
+                    });
+                }
+            });
+    });
+}
+
+fn roster_slot_card(row: &mut ChildSpawnerCommands, f: &Handle<Font>, idx: usize) {
+    row.spawn((
+        RosterRow(idx),
+        Node {
+            flex_basis: Val::Px(0.0),
+            flex_grow: 1.0,
+            min_width: Val::Px(0.0),
+            padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(5.0)),
+            ..default()
+        },
+        BackgroundColor(ROSTER_CARD),
+        BorderColor::all(ROSTER_EDGE),
+    ))
+    .with_children(|card| {
+        card.spawn(Node {
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|top| {
+            top.spawn((RosterCaption::SlotName(idx), text_bundle(f, "", 20.0, GOLD)));
+            top.spawn(Node {
+                column_gap: Val::Px(6.0),
+                ..default()
+            })
+            .with_children(|btns| {
+                roster_button(
+                    btns,
+                    f,
+                    MenuAction::SelectCharacter(idx),
+                    "Select",
+                    88.0,
+                    34.0,
+                    Some(RosterCaption::SlotSelect(idx)),
+                );
+                roster_button(
+                    btns,
+                    f,
+                    MenuAction::DeleteCharacter(idx),
+                    "Delete",
+                    92.0,
+                    34.0,
+                    Some(RosterCaption::SlotDelete(idx)),
+                );
+            });
+        });
+        card.spawn((
+            RosterCaption::SlotInfo(idx),
+            text_bundle(f, "", 14.0, ROSTER_MUTED),
+        ));
+    });
+}
+
+fn roster_button(
+    ui: &mut ChildSpawnerCommands,
+    f: &Handle<Font>,
+    action: MenuAction,
+    label: &str,
+    width: f32,
+    height: f32,
+    caption: Option<RosterCaption>,
+) {
+    ui.spawn((
+        RosterBtn,
+        action,
+        GlueDisabled(false),
+        Button,
+        Node {
+            width: Val::Px(width),
+            height: Val::Px(height),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
+            ..default()
+        },
+        BackgroundColor(ROSTER_BTN),
+        BorderColor::all(ROSTER_EDGE),
+    ))
+    .with_children(|b| {
+        if let Some(cap) = caption {
+            b.spawn((
+                cap,
+                centered_bundle(f, label, 16.0, GOLD),
+                FocusPolicy::Pass,
+            ));
+        } else {
+            b.spawn((centered_bundle(f, label, 16.0, GOLD), FocusPolicy::Pass));
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(super) fn roster_text_input(
+    phase: Res<State<Phase>>,
+    mut roster_ui: ResMut<RosterUi>,
+    mut keyboard: MessageReader<KeyboardInput>,
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    layout: Option<Res<crate::bindings::LayoutNames>>,
+    mut clipboard: Option<NonSendMut<crate::textinput::HostClipboard>>,
+    raw_handle: Query<&bevy::window::RawHandleWrapper, With<bevy::window::PrimaryWindow>>,
+    mut parts: Query<(&GlueFieldPart, Option<&mut Text>, &mut Visibility), With<RosterNameField>>,
+) {
+    if *phase.get() != Phase::Menu || !roster_ui.open {
+        keyboard.clear();
+        return;
+    }
+
+    let mods = crate::textinput::mods_now(&keys);
+    let wl = crate::textinput::wayland_display(raw_handle.iter().next());
+    crate::textinput::tick_caret(&mut roster_ui.name_box, true, time.delta_secs());
+
+    for ev in keyboard.read() {
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
+        if let (Some(layout), Some(clipboard)) = (layout.as_deref(), clipboard.as_deref_mut()) {
+            let _ = crate::textinput::feed_key(
+                &mut roster_ui.name_box,
+                ev,
+                mods,
+                layout,
+                clipboard,
+                wl,
+                crate::textinput::CharFilter::Letters,
+            );
+        } else if ev.key_code == KeyCode::Backspace {
+            roster_ui.name_box.delete_dir(false);
+        } else if let Some(text) = &ev.text {
+            let clean: String = text.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            if !clean.is_empty() {
+                roster_ui.name_box.insert(&clean);
+            }
+        }
+    }
+
+    paint_glue_field(&roster_ui.name_box, true, parts.iter_mut());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -542,6 +1052,7 @@ pub(super) fn menu_clicks(
     #[cfg(target_os = "android")] touch: Res<super::menu_touch::MenuTouch>,
     #[cfg(target_os = "android")] mouse: Res<ButtonInput<MouseButton>>,
     mut shop: ResMut<perk_shop::Shop>,
+    mut roster_ui: ResMut<RosterUi>,
     mut progress: ResMut<perks::Progress>,
     actions: Query<(Entity, &MenuAction)>,
     phase: Res<State<Phase>>,
@@ -568,9 +1079,116 @@ pub(super) fn menu_clicks(
     #[cfg(not(target_os = "android"))]
     let picked = mouse_action();
     let Some((_, &action)) = picked else { return };
+
+    if roster_ui.open {
+        match action {
+            MenuAction::CloseCharacters => roster_ui.close(),
+            MenuAction::RandomCharacterName => {
+                let mut name = perks::random_hero_name(rng.next_u64());
+                if name.eq_ignore_ascii_case(&roster_ui.name_box.text) {
+                    name = perks::random_hero_name(rng.next_u64());
+                }
+                roster_ui.name_box.set_text(name);
+                roster_ui.confirm_delete = None;
+                roster_ui.feedback.clear();
+            }
+            MenuAction::SelectCharacter(idx) => {
+                if let Some(slot) = progress.slots().get(idx) {
+                    let id = slot.id;
+                    let slot_name = slot.name.clone();
+                    match progress.select_slot(id) {
+                        Ok(()) => {
+                            apply_slot_to_selection(
+                                progress.active_slot(),
+                                &progress,
+                                creatures.as_deref(),
+                                &mut selection,
+                            );
+                            roster_ui.name_box.set_text(&progress.active_slot().name);
+                            roster_ui.feedback = format!("Selected {slot_name}.");
+                        }
+                        Err(err) => roster_ui.feedback = err.to_owned(),
+                    }
+                }
+                roster_ui.confirm_delete = None;
+            }
+            MenuAction::CreateCharacter => {
+                let class_id = selection.class_def().map_or(data::CLASSES[0].id, |c| c.id);
+                let (race, sex) = selection
+                    .look
+                    .and_then(|i| selection.looks.get(i))
+                    .map_or((1, 0), |&(_, r, s)| (r, s));
+                let entered = roster_ui.name_box.text.clone();
+                match progress.create_slot(&entered, class_id, race, sex, selection.map) {
+                    Ok(_) => {
+                        apply_slot_to_selection(
+                            progress.active_slot(),
+                            &progress,
+                            creatures.as_deref(),
+                            &mut selection,
+                        );
+                        roster_ui.name_box.set_text(&progress.active_slot().name);
+                        roster_ui.feedback = format!("Created {}.", progress.active_slot().name);
+                    }
+                    Err(err) => roster_ui.feedback = err.to_owned(),
+                }
+                roster_ui.confirm_delete = None;
+            }
+            MenuAction::RenameCharacter => {
+                let active_id = progress.active_slot_id();
+                let entered = roster_ui.name_box.text.clone();
+                match progress.rename_slot(active_id, &entered) {
+                    Ok(()) => {
+                        roster_ui.name_box.set_text(&progress.active_slot().name);
+                        roster_ui.feedback =
+                            format!("Renamed hero to {}.", progress.active_slot().name);
+                    }
+                    Err(err) => roster_ui.feedback = err.to_owned(),
+                }
+                roster_ui.confirm_delete = None;
+            }
+            MenuAction::DeleteCharacter(idx) => {
+                if let Some((id, name)) = progress.slots().get(idx).map(|s| (s.id, s.name.clone()))
+                {
+                    if progress.slot_count() <= 1 {
+                        roster_ui.feedback = "Cannot delete the last character.".into();
+                        roster_ui.confirm_delete = None;
+                    } else if roster_ui.confirm_delete == Some(id) {
+                        match progress.delete_slot(id) {
+                            Ok(()) => {
+                                apply_slot_to_selection(
+                                    progress.active_slot(),
+                                    &progress,
+                                    creatures.as_deref(),
+                                    &mut selection,
+                                );
+                                roster_ui.name_box.set_text(&progress.active_slot().name);
+                                roster_ui.feedback = format!("Deleted {name}.");
+                            }
+                            Err(err) => roster_ui.feedback = err.to_owned(),
+                        }
+                        roster_ui.confirm_delete = None;
+                    } else {
+                        roster_ui.confirm_delete = Some(id);
+                        roster_ui.feedback = format!("Click Delete again to remove {name}.");
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if action == MenuAction::OpenCharacters {
+        shop.close();
+        roster_ui.open_with(&progress.active_slot().name);
+        return;
+    }
+
     if shop.handle(&mut progress, action) {
         return;
     }
+
     let Some(creatures) = creatures.as_deref() else {
         return;
     };
@@ -582,15 +1200,27 @@ pub(super) fn menu_clicks(
     let (race, sex) = (cur.map(|c| c.0), cur.map_or(0, |c| c.1));
     match action {
         MenuAction::Map(i) => {
-            if selection.map != i {
+            if progress.is_zone_unlocked(i) && selection.map != i {
                 selection.map = i;
+                if !progress.is_tier_unlocked(i, selection.tier) {
+                    selection.tier = data::DifficultyTier::Normal;
+                }
+                selection.version += 1;
+            }
+        }
+        MenuAction::Tier(idx) => {
+            let tier = data::DifficultyTier::from_index(idx);
+            if progress.is_tier_unlocked(selection.map, tier) && selection.tier != tier {
+                selection.tier = tier;
                 selection.version += 1;
             }
         }
         MenuAction::Enter => {
-            if start_run(&mut run, &mut selection, &progress) {
+            sync_selection_to_progress(&selection, &mut progress);
+            if start_run(&mut run, &mut selection, &progress, false) {
                 next.set(Phase::Playing);
             }
+            return;
         }
         MenuAction::Randomize => {
             let picks: Vec<(usize, usize)> = all
@@ -635,32 +1265,105 @@ pub(super) fn menu_clicks(
         MenuAction::OpenPassives
         | MenuAction::ClosePassives
         | MenuAction::BuyPassive(_)
-        | MenuAction::EquipPassive(_) => return,
+        | MenuAction::EquipPassive(_)
+        | MenuAction::RespecPassives
+        | MenuAction::OpenCharacters
+        | MenuAction::CloseCharacters
+        | MenuAction::SelectCharacter(_)
+        | MenuAction::CreateCharacter
+        | MenuAction::RenameCharacter
+        | MenuAction::RandomCharacterName
+        | MenuAction::DeleteCharacter(_) => return,
     }
-    save_pick(&selection);
+    sync_selection_to_progress(&selection, &mut progress);
 }
 
-/// The screen's per-frame state: the locked highlights, hover labels, which races and classes
-/// the pick allows, the gender on the race faces, the name line and Enter World.
+/// The screen's per-frame state: panel visibility, locked highlights, hover labels, zone/tier
+/// unlocks, active hero summary, and the Character Roster overlay.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn refresh_menu_ui(
     selection: Res<Selection>,
+    progress: Res<perks::Progress>,
+    shop: Res<perk_shop::Shop>,
+    roster_ui: Res<RosterUi>,
     creatures: Option<Res<crate::entities::Creatures>>,
     art: Res<GlueArt>,
-    mut buttons: Query<(
-        &MenuAction,
-        &Interaction,
-        &Children,
-        Option<&mut LockHighlight>,
-        Option<&mut GlueDisabled>,
-        &mut Node,
+    mut panels: Query<(&perk_shop::Panel, &mut Node, &mut Visibility)>,
+    mut buttons: Query<
+        (
+            &MenuAction,
+            &Interaction,
+            &Children,
+            Option<&mut LockHighlight>,
+            Option<&mut GlueDisabled>,
+            &mut Node,
+            &mut Visibility,
+        ),
+        (
+            Without<perk_shop::Panel>,
+            Without<perk_shop::ShopButton>,
+            Without<RosterRow>,
+            Without<RosterBtn>,
+        ),
+    >,
+    mut roster_rows: Query<
+        (&RosterRow, &mut Node, &mut Visibility, &mut BackgroundColor),
+        (Without<perk_shop::Panel>, Without<MenuAction>),
+    >,
+    mut roster_btn_colors: Query<
+        (
+            &MenuAction,
+            &Interaction,
+            &mut GlueDisabled,
+            &mut BackgroundColor,
+        ),
+        (
+            With<RosterBtn>,
+            Without<RosterRow>,
+            Without<perk_shop::Panel>,
+        ),
+    >,
+    mut labels: Query<
         &mut Visibility,
-    )>,
-    mut labels: Query<&mut Visibility, (With<HoverLabel>, Without<MenuAction>)>,
+        (
+            With<HoverLabel>,
+            Without<MenuAction>,
+            Without<perk_shop::Panel>,
+            Without<RosterRow>,
+        ),
+    >,
     mut faces: Query<(&RaceFace, &mut ImageNode)>,
-    mut name: Query<(&mut Text, &mut TextColor), With<PickName>>,
+    mut texts: ParamSet<(
+        Query<&mut Text, With<HeroLauncherLabel>>,
+        Query<(&mut Text, &mut TextColor), With<PickName>>,
+        Query<&mut Text, With<PickSub>>,
+        Query<(&ZoneTitle, &mut Text, &mut TextColor)>,
+        Query<(&ZoneSub, &mut Text, &mut TextColor)>,
+        Query<(&mut Text, &mut TextColor), With<TierHint>>,
+        Query<(&RosterCaption, &mut Text)>,
+    )>,
     mut cache: Local<(Option<u32>, bool, Vec<Vec<(u32, u8, u8)>>)>,
 ) {
+    for (panel, mut node, mut vis) in &mut panels {
+        let show = match panel {
+            perk_shop::Panel::Picker => !shop.open && !roster_ui.open,
+            perk_shop::Panel::Characters => roster_ui.open,
+            perk_shop::Panel::Passives => continue,
+        };
+        let want_vis = if show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        let want_disp = if show { Display::Flex } else { Display::None };
+        if *vis != want_vis {
+            *vis = want_vis;
+        }
+        if node.display != want_disp {
+            node.display = want_disp;
+        }
+    }
+
     let have = creatures.is_some();
     if cache.0 != Some(selection.version) || cache.1 != have {
         *cache = (
@@ -675,12 +1378,19 @@ pub(super) fn refresh_menu_ui(
         .and_then(|i| selection.looks.get(i))
         .map(|&(_, r, s)| (r, s));
 
+    let name_valid = !roster_ui.name_box.text.trim().is_empty();
+    let slots = progress.slots();
+    let active_id = progress.active_slot_id();
+    let zone_ok = progress.is_zone_unlocked(selection.map);
+    let tier_ok = progress.is_tier_unlocked(selection.map, selection.tier);
+
     for (action, interaction, children, lock, disabled, mut node, mut vis) in &mut buttons {
         let selected = match *action {
             MenuAction::Race(r) => cur.is_some_and(|c| c.0 == r),
             MenuAction::Sex(s) => cur.is_some_and(|c| c.1 == s),
             MenuAction::Class(i) => selection.class == Some(i),
             MenuAction::Map(i) => selection.map == i,
+            MenuAction::Tier(idx) => selection.tier == data::DifficultyTier::from_index(idx),
             _ => false,
         };
         if let Some(mut lock) = lock {
@@ -689,7 +1399,14 @@ pub(super) fn refresh_menu_ui(
             }
         }
         if let Some(mut disabled) = disabled {
-            let off = *action == MenuAction::Enter && cur.is_none();
+            let off = match *action {
+                MenuAction::Enter => cur.is_none() || !zone_ok || !tier_ok,
+                MenuAction::Map(i) => !progress.is_zone_unlocked(i),
+                MenuAction::Tier(idx) => {
+                    !progress.is_tier_unlocked(selection.map, data::DifficultyTier::from_index(idx))
+                }
+                _ => false,
+            };
             if disabled.0 != off {
                 disabled.0 = off;
             }
@@ -744,19 +1461,235 @@ pub(super) fn refresh_menu_ui(
         }
     }
 
+    let active = progress.active_slot();
+    if let Ok(mut t) = texts.p0().single_mut() {
+        let want = format!("Hero: {} (Lv {})", active.name, active.level);
+        if **t != want {
+            **t = want;
+        }
+    }
+
     let class = selection.class_def();
-    if let Ok((mut t, mut color)) = name.single_mut() {
+    if let Ok((mut t, mut color)) = texts.p1().single_mut() {
         let want = match (class, cur) {
-            (Some(c), Some((r, _))) => format!("{} {}", race_name(r), c.name),
-            _ => String::new(),
+            (Some(c), Some((r, _))) => format!("{} — {} {}", active.name, race_name(r), c.name),
+            _ => active.name.clone(),
         };
         if t.0 != want {
             t.0 = want;
         }
-        // In the class's own colour, as the game's raid frames and chat show it.
         let want = class.map_or(GOLD, |c| rgb(c.color));
         if color.0 != want {
             color.0 = want;
+        }
+    }
+
+    if let Ok(mut t) = texts.p2().single_mut() {
+        let bonus = progress.starter_bonus();
+        let next_xp = perks::char_xp_to_next(active.level);
+        let mut parts = vec![
+            format!("Lv {} ({}/{} XP)", active.level, active.xp, next_xp),
+            selection.tier.label().to_owned(),
+            format!("Start Lv {}", bonus.starting_level),
+        ];
+        if bonus.initial_drafts > 0 {
+            parts.push(format!("+{} Draft", bonus.initial_drafts));
+        }
+        if bonus.starter_ability_bonus > 0 {
+            parts.push(format!("+{} Start Spell Rank", bonus.starter_ability_bonus));
+        }
+        let want = parts.join("  •  ");
+        if t.0 != want {
+            t.0 = want;
+        }
+    }
+
+    for (ZoneTitle(i), _, mut color) in &mut texts.p3() {
+        let unlocked = progress.is_zone_unlocked(*i);
+        let want = if unlocked { GOLD } else { DIM };
+        if color.0 != want {
+            color.0 = want;
+        }
+    }
+
+    for (ZoneSub(i), mut t, mut color) in &mut texts.p4() {
+        let map = &data::MAPS[*i];
+        let unlocked = progress.is_zone_unlocked(*i);
+        let (want_text, want_color) = if unlocked {
+            let (lo, hi) = zone_level_bounds(*i);
+            let levels = if lo == hi {
+                format!("Lv {lo}")
+            } else {
+                format!("Lv {lo}-{hi}")
+            };
+            if let Some(best) = progress.zone_best_tier(*i) {
+                (
+                    format!("{levels}  •  {} Clear", best.label()),
+                    Color::srgb(0.45, 0.90, 0.45),
+                )
+            } else {
+                (format!("{levels}  {}", map.zone), Color::WHITE)
+            }
+        } else {
+            let hint = data::zone_unlock_hint(map.name).unwrap_or("Clear previous zone");
+            (format!("Locked · {hint}"), DIM)
+        };
+        if t.0 != want_text {
+            t.0 = want_text;
+        }
+        if color.0 != want_color {
+            color.0 = want_color;
+        }
+    }
+
+    if let Ok((mut t, mut color)) = texts.p5().single_mut() {
+        let (want_text, want_color) = if !zone_ok {
+            let hint = data::zone_unlock_hint(selection.map_def().name)
+                .unwrap_or("Clear prerequisite zone first");
+            (format!("Zone locked: {hint}"), DIM)
+        } else if !tier_ok {
+            (
+                format!(
+                    "{} locked: {}",
+                    selection.tier.label(),
+                    data::tier_unlock_hint(selection.tier)
+                ),
+                DIM,
+            )
+        } else {
+            let tier = selection.tier;
+            let z_mult = data::zone_reward_mult(selection.map) * tier.reward_mult();
+            (
+                format!(
+                    "{}: Enemy HP x{:.2} · Dmg x{:.2}\nXP x{:.2} · Rewards x{:.2}",
+                    tier.label(),
+                    tier.hp_mult(),
+                    tier.damage_mult(),
+                    tier.xp_mult(),
+                    z_mult,
+                ),
+                ROSTER_MUTED,
+            )
+        };
+        if t.0 != want_text {
+            t.0 = want_text;
+        }
+        if color.0 != want_color {
+            color.0 = want_color;
+        }
+    }
+
+    for (RosterRow(idx), mut node, mut vis, mut bg) in &mut roster_rows {
+        let slot = slots.get(*idx);
+        let show = slot.is_some();
+        let want_vis = if show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        let want_disp = if show { Display::Flex } else { Display::None };
+        if *vis != want_vis {
+            *vis = want_vis;
+        }
+        if node.display != want_disp {
+            node.display = want_disp;
+        }
+        if let Some(s) = slot {
+            let want_bg = if s.id == active_id {
+                ROSTER_ACTIVE_CARD
+            } else {
+                ROSTER_CARD
+            };
+            if bg.0 != want_bg {
+                bg.0 = want_bg;
+            }
+        }
+    }
+
+    for (cap, mut text) in &mut texts.p6() {
+        let want = match *cap {
+            RosterCaption::SlotCount => format!(
+                "{} / {} slots   •   Active: {} (Lv {}, {}/{} XP)",
+                slots.len(),
+                perks::MAX_CHARACTERS,
+                active.name,
+                active.level,
+                active.xp,
+                perks::char_xp_to_next(active.level),
+            ),
+            RosterCaption::Feedback => roster_ui.feedback.clone(),
+            RosterCaption::SlotName(idx) => match slots.get(idx) {
+                Some(s) if s.id == active_id => format!("{}  ★ Active", s.name),
+                Some(s) => s.name.clone(),
+                None => String::new(),
+            },
+            RosterCaption::SlotInfo(idx) => match slots.get(idx) {
+                Some(s) => {
+                    let class_name =
+                        data::class_by_id(s.class_id).map_or("Adventurer", |(_, c)| c.name);
+                    let best_m = s.records.best_time_secs / 60;
+                    let best_s = s.records.best_time_secs % 60;
+                    format!(
+                        "Lv {} {} {}  •  {} ({})\nRuns {} ({} wins)  •  Kills {}  •  Best {:02}:{:02}",
+                        s.level,
+                        race_name(s.race),
+                        class_name,
+                        s.last_zone,
+                        s.tier.label(),
+                        s.records.runs,
+                        s.records.wins,
+                        s.records.kills,
+                        best_m,
+                        best_s,
+                    )
+                }
+                None => String::new(),
+            },
+            RosterCaption::SlotSelect(idx) => {
+                if slots.get(idx).is_some_and(|s| s.id == active_id) {
+                    "Active".into()
+                } else {
+                    "Select".into()
+                }
+            }
+            RosterCaption::SlotDelete(idx) => {
+                if slots
+                    .get(idx)
+                    .is_some_and(|s| roster_ui.confirm_delete == Some(s.id))
+                {
+                    "Confirm?".into()
+                } else {
+                    "Delete".into()
+                }
+            }
+        };
+        if **text != want {
+            **text = want;
+        }
+    }
+
+    for (action, interaction, mut disabled, mut bg) in &mut roster_btn_colors {
+        let off = match *action {
+            MenuAction::CreateCharacter => {
+                progress.slot_count() >= perks::MAX_CHARACTERS || !name_valid
+            }
+            MenuAction::RenameCharacter => !name_valid,
+            MenuAction::SelectCharacter(idx) => slots.get(idx).is_none_or(|s| s.id == active_id),
+            MenuAction::DeleteCharacter(idx) => progress.slot_count() <= 1 || idx >= slots.len(),
+            _ => false,
+        };
+        if disabled.0 != off {
+            disabled.0 = off;
+        }
+        let want = if disabled.0 {
+            ROSTER_BTN_OFF
+        } else if *interaction != Interaction::None {
+            ROSTER_BTN_HOT
+        } else {
+            ROSTER_BTN
+        };
+        if bg.0 != want {
+            bg.0 = want;
         }
     }
 }

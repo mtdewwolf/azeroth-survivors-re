@@ -5,6 +5,7 @@ use bevy::prelude::*;
 
 use super::enemies::Enemy;
 use super::hero::{self, Hero};
+use super::state::{PlayerHero, PlayerInputs, PlayerState};
 use super::units::{flat, Fx};
 use super::{Phase, Run};
 use benilla_world::world_point::WorldPoint;
@@ -142,7 +143,7 @@ static MOBILITY: &[(u8, Mobility)] = &[
     ),
 ];
 
-/// The mobility's run state, on [`Run`]: cooldown left, and the haste or vanish still running.
+/// The mobility's run state, on [`PlayerState`]: cooldown left, and the haste or vanish still running.
 #[derive(Default, Clone, Copy)]
 pub(super) struct MobilityState {
     pub cd: f32,
@@ -151,7 +152,7 @@ pub(super) struct MobilityState {
     pub vanish_t: f32,
 }
 
-impl Run {
+impl PlayerState {
     /// The class's mobility once the hero is level enough.
     pub(super) fn mobility(&self) -> Option<&'static Mobility> {
         (self.level >= LEARN_LEVEL)
@@ -169,55 +170,21 @@ impl Run {
     }
 }
 
-/// `F`: cast the mobility if it is learned and ready; ticks the cooldown and the running effect.
+/// Cast each player's mobility from [`PlayerInputs`] if learned and ready; ticks cooldowns and buffs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cast_mobility(
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    #[cfg(target_os = "android")] touch: Res<super::touch::TouchControls>,
+    inputs: Res<PlayerInputs>,
     phase: Res<State<Phase>>,
     mut run: ResMut<Run>,
     world: WorldPoint,
-    mut hero: Query<(Entity, &mut Transform), With<Hero>>,
+    mut heroes: Query<(Entity, &mut Transform, &PlayerHero), With<Hero>>,
     mut enemies: Query<(Entity, &Transform, &mut Enemy), Without<Hero>>,
-    selection: Res<super::Selection>,
-    aim: Res<hero::AimPoint>,
     mut fx: Fx,
 ) {
     let dt = time.delta_secs();
-    let m = &mut run.mobile;
-    m.cd = (m.cd - dt).max(0.0);
-    m.haste_t = (m.haste_t - dt).max(0.0);
-    m.vanish_t = (m.vanish_t - dt).max(0.0);
-    let cast = keys.just_pressed(KEY);
-    #[cfg(target_os = "android")]
-    let cast = cast || touch.mobility;
-    if *phase.get() != Phase::Playing || run.dead_t.is_some() || !cast {
-        return;
-    }
-    let Some(def) = run.mobility() else { return };
-    if run.mobile.cd > 0.0 {
-        return;
-    }
-    let Ok((me, mut tf)) = hero.single_mut() else {
-        return;
-    };
-    let pos = tf.translation;
-    let facing = tf.rotation * Vec3::NEG_Z;
-    let facing = flat(facing).normalize_or(Vec3::NEG_Z);
-    // Aimed at the cursor where there is one, else straight ahead.
-    let cursor = aim.0.filter(|a| flat(*a - pos).length() > 0.5);
-    #[cfg(target_os = "android")]
-    let cursor = if touch.mobility {
-        Vec3::new(touch.direction.x, 0.0, touch.direction.y)
-            .try_normalize()
-            .map(|direction| pos + direction * 100.0)
-    } else {
-        cursor
-    };
-    let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
-    // Keep any jump inside the battleground's leash.
-    let map = selection.map_def();
+    let playing = *phase.get() == Phase::Playing;
+    let map = run.match_state.config.map;
     let center = hero::arena(map);
     let leash = |p: Vec3| {
         let off = flat(p - center);
@@ -228,63 +195,87 @@ pub(super) fn cast_mobility(
         }
     };
     let ground = |p: Vec3| world.terrain_height_under(p).unwrap_or(p.y);
-    match def.kind {
-        Move::Blink(yd) => {
-            fx.cast(me, def.spell, &[me], None);
-            // To the cursor, or as far as the spell reaches toward it.
-            let far = cursor.map_or(yd, |a| flat(a - pos).length().min(yd));
-            tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
-            let mut to = leash(pos + toward * far);
-            to.y = ground(to);
-            tf.translation = to;
+
+    for player in &mut run.players {
+        let m = &mut player.mobile;
+        m.cd = (m.cd - dt).max(0.0);
+        m.haste_t = (m.haste_t - dt).max(0.0);
+        m.vanish_t = (m.vanish_t - dt).max(0.0);
+
+        let input = inputs.get(player.id);
+        if !playing || player.dead_t.is_some() || !input.mobility {
+            continue;
         }
-        Move::Charge(yd) => {
-            // The enemy in reach nearest the cursor (or the hero, with none).
-            let mark = cursor.unwrap_or(pos);
-            let target = enemies
-                .iter()
-                .filter(|(_, t, e)| !e.dead && hero::reach(pos, t.translation) <= yd)
-                .map(|(e, t, _)| (e, t.translation, hero::reach(mark, t.translation)))
-                .min_by(|a, b| a.2.total_cmp(&b.2));
-            let to = match target {
-                Some((e, at, _)) => {
-                    if let Ok((_, _, mut en)) = enemies.get_mut(e) {
-                        en.stun_t = en.stun_t.max(def.secs);
+        let Some(def) = player.mobility() else {
+            continue;
+        };
+        if player.mobile.cd > 0.0 {
+            continue;
+        }
+        let Some((me, mut tf, _)) = heroes.iter_mut().find(|(_, _, ph)| ph.0 == player.id) else {
+            continue;
+        };
+        let pos = tf.translation;
+        let facing = tf.rotation * Vec3::NEG_Z;
+        let facing = flat(facing).normalize_or(Vec3::NEG_Z);
+        let cursor = input.mobility_aim.filter(|a| flat(*a - pos).length() > 0.5);
+        let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
+        match def.kind {
+            Move::Blink(yd) => {
+                fx.cast(me, def.spell, &[me], None);
+                let far = cursor.map_or(yd, |a| flat(a - pos).length().min(yd));
+                tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
+                let mut to = leash(pos + toward * far);
+                to.y = ground(to);
+                tf.translation = to;
+            }
+            Move::Charge(yd) => {
+                let mark = cursor.unwrap_or(pos);
+                let target = enemies
+                    .iter()
+                    .filter(|(_, t, e)| !e.dead && hero::reach(pos, t.translation) <= yd)
+                    .map(|(e, t, _)| (e, t.translation, hero::reach(mark, t.translation)))
+                    .min_by(|a, b| a.2.total_cmp(&b.2));
+                let to = match target {
+                    Some((e, at, _)) => {
+                        if let Ok((_, _, mut en)) = enemies.get_mut(e) {
+                            en.stun_t = en.stun_t.max(def.secs);
+                        }
+                        let dir = flat(at - pos).normalize_or(facing);
+                        tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(dir));
+                        fx.cast(me, def.spell, &[e], None);
+                        at - dir * 1.5
                     }
-                    let dir = flat(at - pos).normalize_or(facing);
-                    tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(dir));
-                    fx.cast(me, def.spell, &[e], None);
-                    at - dir * 1.5
-                }
-                None => {
-                    fx.cast(me, def.spell, &[me], None);
-                    tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
-                    pos + toward * yd * 0.5
-                }
-            };
-            let mut to = leash(to);
-            to.y = ground(to);
-            tf.translation = to;
-        }
-        Move::Haste(x) => {
-            fx.cast(me, def.spell, &[me], None);
-            run.mobile.haste = x;
-            run.mobile.haste_t = def.secs;
-        }
-        Move::Vanish(x) => {
-            fx.cast(me, def.spell, &[me], None);
-            run.mobile.haste = x;
-            run.mobile.haste_t = def.secs;
-            run.mobile.vanish_t = def.secs;
-        }
-        Move::Scatter(r) => {
-            fx.cast(me, def.spell, &[me], None);
-            for (_, t, mut en) in &mut enemies {
-                if !en.dead && !en.boss && hero::reach(pos, t.translation) <= r {
-                    en.fear_t = en.fear_t.max(def.secs);
+                    None => {
+                        fx.cast(me, def.spell, &[me], None);
+                        tf.rotation = Quat::from_rotation_y(super::units::yaw_toward(toward));
+                        pos + toward * yd * 0.5
+                    }
+                };
+                let mut to = leash(to);
+                to.y = ground(to);
+                tf.translation = to;
+            }
+            Move::Haste(x) => {
+                fx.cast(me, def.spell, &[me], None);
+                player.mobile.haste = x;
+                player.mobile.haste_t = def.secs;
+            }
+            Move::Vanish(x) => {
+                fx.cast(me, def.spell, &[me], None);
+                player.mobile.haste = x;
+                player.mobile.haste_t = def.secs;
+                player.mobile.vanish_t = def.secs;
+            }
+            Move::Scatter(r) => {
+                fx.cast(me, def.spell, &[me], None);
+                for (_, t, mut en) in &mut enemies {
+                    if !en.dead && !en.boss && hero::reach(pos, t.translation) <= r {
+                        en.fear_t = en.fear_t.max(def.secs);
+                    }
                 }
             }
         }
+        player.mobile.cd = def.cooldown;
     }
-    run.mobile.cd = def.cooldown;
 }

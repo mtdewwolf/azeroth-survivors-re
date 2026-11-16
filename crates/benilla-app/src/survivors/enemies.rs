@@ -11,7 +11,7 @@ use super::abilities::Hit;
 use super::data::{self, EnemyDef};
 use super::hero::{self, Hero, HERO_RADIUS};
 use super::units::{self, flat, yaw_toward, Fx, Marks, UnitSpec, COLOR_HURT};
-use super::{Phase, Rng, Run, Selection};
+use super::{Phase, PlayerHero, PlayerId, Rng, Run};
 use crate::creature_anim::{move_flags, MovementState};
 use crate::net::{FieldChanged, Guid, ObjectStore};
 
@@ -38,6 +38,7 @@ pub(super) struct Enemy {
 }
 
 pub(super) struct Dot {
+    pub source: PlayerId,
     pub dps: f32,
     pub left: f32,
     pub tick: f32,
@@ -101,7 +102,10 @@ fn spawn_enemy(
     hero: Vec3,
     boss: bool,
 ) {
-    let scale = data::hp_scale(run.elapsed);
+    let hp_scale = run.match_state.enemy_hp_mult();
+    let dmg_scale = run.match_state.enemy_damage_mult();
+    let spd_scale = run.match_state.enemy_speed_mult();
+    let xp_scale = run.match_state.enemy_xp_mult();
     let serial = run.guid();
     let e = units::spawn_unit(
         commands,
@@ -118,16 +122,16 @@ fn spawn_enemy(
         pos,
         yaw_toward(hero - pos),
     );
-    let hp = def.hp * scale;
+    let hp = def.hp * hp_scale;
     commands.entity(e).insert((
         Enemy {
             def,
             hp,
             max_hp: hp,
-            speed: def.speed,
-            damage: def.damage * data::damage_scale(run.elapsed),
+            speed: def.speed * spd_scale,
+            damage: def.damage * dmg_scale,
             radius: radius_for(def),
-            xp: def.xp,
+            xp: ((def.xp as f32) * xp_scale).round().max(1.0) as u32,
             boss,
             attack_cd: 0.5,
             slow: 1.0,
@@ -157,23 +161,29 @@ pub(super) fn spawn_enemies(
     mut run: ResMut<Run>,
     mut rng: ResMut<Rng>,
     mut spawner: ResMut<Spawner>,
-    selection: Res<Selection>,
-    hero: Query<&Transform, With<Hero>>,
+    hero: Query<(&Transform, &PlayerHero), With<Hero>>,
     enemies: Query<&Enemy>,
     world: WorldPoint,
 ) {
-    let Ok(h) = hero.single() else { return };
-    if run.dead_t.is_some() {
+    if !run.any_alive() {
         return;
     }
-    let hpos = h.translation;
-    let elapsed = run.elapsed;
-    let roster = data::roster(selection.map);
+    let alive_heroes: Vec<Vec3> = hero
+        .iter()
+        .filter(|(_, ph)| run.player(ph.0).is_some_and(|p| p.dead_t.is_none()))
+        .map(|(tf, _)| tf.translation)
+        .collect();
+    if alive_heroes.is_empty() {
+        return;
+    }
+    let hpos = alive_heroes[rng.index(alive_heroes.len())];
+    let elapsed = run.match_state.elapsed;
+    let roster = data::roster(run.match_state.config.map_index);
     let pool = data::wave_pool(elapsed, roster.enemies.len());
 
     let due_bosses = ((elapsed / data::BOSS_EVERY_SECS) as u32).min(roster.bosses.len() as u32);
-    while run.bosses < due_bosses {
-        let def = &roster.bosses[run.bosses as usize];
+    while run.match_state.bosses < due_bosses {
+        let def = &roster.bosses[run.match_state.bosses as usize];
         let a = rng.range(0.0, std::f32::consts::TAU);
         let pos = ground(
             &world,
@@ -181,14 +191,14 @@ pub(super) fn spawn_enemies(
             hpos.y,
         );
         spawn_enemy(&mut commands, &mut run, def, pos, hpos, true);
-        run.bosses += 1;
-        run.banner = Some((format!("{} approaches!", def.name), 4.0));
+        run.match_state.bosses += 1;
+        run.match_state.banner = Some((format!("{} approaches!", def.name), 4.0));
     }
 
     // Half way between bosses, a closing ring of the moment's weakest.
     let due_rings = ((elapsed + data::BOSS_EVERY_SECS / 2.0) / data::BOSS_EVERY_SECS) as u32;
-    if run.rings < due_rings {
-        run.rings = due_rings;
+    if run.match_state.rings < due_rings {
+        run.match_state.rings = due_rings;
         let def = &roster.enemies[pool[0]];
         let n = 28 + (data::progress(elapsed) * 60.0) as usize;
         for i in 0..n {
@@ -200,7 +210,7 @@ pub(super) fn spawn_enemies(
             );
             spawn_enemy(&mut commands, &mut run, def, pos, hpos, false);
         }
-        run.banner = Some(("They're surrounding you!".into(), 3.0));
+        run.match_state.banner = Some(("They're surrounding you!".into(), 3.0));
     }
 
     spawner.timer -= time.delta_secs();
@@ -218,8 +228,13 @@ pub(super) fn spawn_enemies(
         let def = &roster.enemies[pool[rng.index(pool.len())]];
         let a = rng.range(0.0, std::f32::consts::TAU);
         let r = rng.range(34.0, 42.0);
-        let pos = ground(&world, hpos + Vec3::new(a.cos(), 0.0, a.sin()) * r, hpos.y);
-        spawn_enemy(&mut commands, &mut run, def, pos, hpos, false);
+        let anchor = alive_heroes[rng.index(alive_heroes.len())];
+        let pos = ground(
+            &world,
+            anchor + Vec3::new(a.cos(), 0.0, a.sin()) * r,
+            anchor.y,
+        );
+        spawn_enemy(&mut commands, &mut run, def, pos, anchor, false);
     }
 }
 
@@ -230,7 +245,7 @@ pub(super) fn move_enemies(
     time: Res<Time>,
     mut run: ResMut<Run>,
     world: WorldPoint,
-    hero: Query<(Entity, &Transform), (With<Hero>, Without<Enemy>)>,
+    hero: Query<(Entity, &Transform, &PlayerHero), (With<Hero>, Without<Enemy>)>,
     mut enemies: Query<(Entity, &mut Transform, &mut Enemy, &mut MovementState), Without<Hero>>,
     mut fx: Fx,
     mut hits: MessageWriter<Hit>,
@@ -239,11 +254,22 @@ pub(super) fn move_enemies(
     if dt <= 0.0 {
         return;
     }
-    let Ok((hero_e, htf)) = hero.single() else {
+    let hero_targets: Vec<(Entity, Vec3, PlayerId, bool, bool)> = hero
+        .iter()
+        .filter_map(|(ent, tf, ph)| {
+            let p = run.player(ph.0)?;
+            Some((
+                ent,
+                tf.translation,
+                ph.0,
+                p.dead_t.is_some(),
+                p.mobile.vanish_t > 0.0,
+            ))
+        })
+        .collect();
+    if hero_targets.is_empty() {
         return;
-    };
-    let hpos = htf.translation;
-    let hero_down = run.dead_t.is_some();
+    }
 
     // Separation over a coarse grid: only neighbours in the same or adjacent cells push.
     const CELL: f32 = 3.0;
@@ -311,18 +337,29 @@ pub(super) fn move_enemies(
             e.weaken = 1.0;
         }
         let pos = tf.translation;
+        let target_hero = hero_targets
+            .iter()
+            .filter(|(_, _, _, down, _)| !*down)
+            .min_by(|a, b| {
+                flat(a.1 - pos)
+                    .length()
+                    .total_cmp(&flat(b.1 - pos).length())
+            })
+            .copied()
+            .unwrap_or(hero_targets[0]);
+        let (hero_e, hpos, player_id, hero_down, vanished) = target_hero;
         let to_hero = flat(hpos - pos);
         let dist = to_hero.length();
 
         // Strays far behind are brought back in front, as the reference genre does.
-        if dist > 75.0 {
+        if dist > 75.0 && !hero_down {
             let back = hpos + to_hero.normalize_or_zero() * 38.0;
             tf.translation = ground(&world, back, hpos.y);
             continue;
         }
 
         // Under Fade the horde has lost the hero: it mills where it stands.
-        let lost = run.mobile.vanish_t > 0.0 && !e.boss;
+        let lost = vanished && !e.boss;
         let held = e.stun_t > 0.0 || e.root_t > 0.0 || lost;
         let contact = dist <= HERO_RADIUS + e.radius + 0.35;
         let mut step = Vec3::ZERO;
@@ -363,13 +400,19 @@ pub(super) fn move_enemies(
         {
             e.attack_cd = if e.boss { 1.0 } else { 1.3 };
             let raw = e.damage * e.weaken;
-            let taken = hero::hurt_hero(&mut run, raw);
+            let (taken, thorns) = if let Some(p) = run.player_mut(player_id) {
+                let taken = hero::hurt_hero(p, raw);
+                let thorns = (p.thorns_t > 0.0).then(|| p.thorns * p.stats().might);
+                (taken, thorns)
+            } else {
+                (0.0, None)
+            };
             fx.swing(ent, hero_e, taken);
             if taken > 0.0 {
                 fx.number(hero_e, taken, false, COLOR_HURT);
             }
-            if run.thorns_t > 0.0 {
-                hits.write(Hit::direct(ent, run.thorns * run.stats().might, false));
+            if let Some(dmg) = thorns {
+                hits.write(Hit::direct(ent, dmg, false, player_id));
             }
         }
     }
@@ -454,17 +497,32 @@ pub(super) fn collect_gems(
     time: Res<Time>,
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
-    hero: Query<&Transform, (With<Hero>, Without<Gem>)>,
+    hero: Query<(&Transform, &PlayerHero), (With<Hero>, Without<Gem>)>,
     mut gems: Query<(Entity, &mut Transform, &mut Gem)>,
 ) {
-    let Ok(h) = hero.single() else { return };
-    if run.dead_t.is_some() {
+    let heroes: Vec<(PlayerId, Vec3, super::Stats)> = hero
+        .iter()
+        .filter_map(|(tf, ph)| {
+            let p = run.player(ph.0)?;
+            (p.dead_t.is_none()).then(|| (ph.0, tf.translation + Vec3::Y * 1.0, p.stats()))
+        })
+        .collect();
+    if heroes.is_empty() {
         return;
     }
     let dt = time.delta_secs();
-    let stats = run.stats();
-    let target = h.translation + Vec3::Y * 1.0;
     for (e, mut tf, mut g) in &mut gems {
+        let Some((pid, target, stats)) = heroes
+            .iter()
+            .min_by(|a, b| {
+                flat(a.1 - tf.translation)
+                    .length()
+                    .total_cmp(&flat(b.1 - tf.translation).length())
+            })
+            .copied()
+        else {
+            continue;
+        };
         let d = target - tf.translation;
         let dist = d.length();
         if !g.pulled && flat(d).length() <= stats.magnet {
@@ -474,9 +532,11 @@ pub(super) fn collect_gems(
             continue;
         }
         if dist < 0.9 {
-            match g.kind {
-                GemKind::Xp(xp) => run.xp += xp as f32 * data::XP_RATE * stats.growth,
-                GemKind::Heal(hp) => run.hp = (run.hp + hp).min(stats.max_hp),
+            if let Some(p) = run.player_mut(pid) {
+                match g.kind {
+                    GemKind::Xp(xp) => p.xp += xp as f32 * data::XP_RATE * stats.growth,
+                    GemKind::Heal(hp) => p.hp = (p.hp + hp).min(stats.max_hp),
+                }
             }
             commands.entity(e).despawn();
             continue;
@@ -484,17 +544,23 @@ pub(super) fn collect_gems(
         g.speed += 30.0 * dt;
         tf.translation += d / dist * (g.speed * dt).min(dist);
     }
-    while run.xp >= data::xp_to_next(run.level) {
-        run.xp -= data::xp_to_next(run.level);
-        run.level += 1;
-        run.pending_levels += 1;
-        if run.level == super::mobility::LEARN_LEVEL {
-            if let Some(m) = super::mobility::for_class(run.class.id) {
-                run.banner = Some((format!("You have learned {}! Press F.", m.name), 4.0));
+    let mut learned: Option<&'static str> = None;
+    for p in &mut run.players {
+        while p.xp >= data::xp_to_next(p.level) {
+            p.xp -= data::xp_to_next(p.level);
+            p.level += 1;
+            p.pending_levels += 1;
+            if p.level == super::mobility::LEARN_LEVEL {
+                if let Some(m) = super::mobility::for_class(p.class.id) {
+                    learned = Some(m.name);
+                }
             }
         }
     }
-    if run.pending_levels > 0 {
+    if let Some(name) = learned {
+        run.match_state.banner = Some((format!("You have learned {name}! Press F."), 4.0));
+    }
+    if run.local().pending_levels > 0 {
         next.set(Phase::LevelUp);
     }
 }

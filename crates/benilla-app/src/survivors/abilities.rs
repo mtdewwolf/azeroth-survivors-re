@@ -7,12 +7,13 @@ use super::data::{AbilityDef, Effect, Kind};
 use super::enemies::{self, Enemy, Loot};
 use super::hero::{self, Hero};
 use super::units::{self, flat, Fx, Marks, UnitSpec, COLOR_HEAL, COLOR_MELEE, COLOR_SPELL};
-use super::{Rng, Run, RunEntity};
+use super::{PlayerHero, PlayerId, Rng, Run, RunEntity};
 use crate::net::{FieldChanged, Guid, ObjectStore};
 
 /// One blow landing on one enemy.
 #[derive(Message, Clone)]
 pub(super) struct Hit {
+    pub source: PlayerId,
     pub target: Entity,
     pub damage: f32,
     pub dot: f32,
@@ -27,8 +28,9 @@ pub(super) struct Hit {
 }
 
 impl Hit {
-    pub fn direct(target: Entity, damage: f32, crit: bool) -> Self {
+    pub fn direct(target: Entity, damage: f32, crit: bool, source: PlayerId) -> Self {
         Self {
+            source,
             target,
             damage,
             dot: 0.0,
@@ -50,6 +52,7 @@ pub(super) struct PendingHits(pub Vec<(f32, Hit)>);
 /// A ground spell's area, ticking on whatever stands in it.
 #[derive(Component)]
 pub(super) struct GroundArea {
+    owner: PlayerId,
     damage: f32,
     dot: f32,
     dot_dur: f32,
@@ -65,6 +68,7 @@ pub(super) struct GroundArea {
 
 #[derive(Component)]
 pub(super) struct Totem {
+    owner: PlayerId,
     cast: u32,
     damage: f32,
     range: f32,
@@ -102,8 +106,16 @@ fn mark_secs(def: &AbilityDef, duration: f32) -> f32 {
     }
 }
 
-fn hit_for(def: &AbilityDef, p: &Params, target: Entity, damage: f32, crit: bool) -> Hit {
+fn hit_for(
+    source: PlayerId,
+    def: &AbilityDef,
+    p: &Params,
+    target: Entity,
+    damage: f32,
+    crit: bool,
+) -> Hit {
     Hit {
+        source,
         target,
         damage,
         dot: p.dot,
@@ -199,32 +211,17 @@ pub(super) fn cast_abilities(
     mut run: ResMut<Run>,
     mut rng: ResMut<Rng>,
     spells: Option<Res<crate::ui_action::Spells>>,
-    hero: Query<(Entity, &Transform), With<Hero>>,
+    hero: Query<(Entity, &Transform, &PlayerHero), With<Hero>>,
     enemies: Query<(Entity, &Transform, &Enemy)>,
     mut fx: Fx,
     mut pending: ResMut<PendingHits>,
     mut hits: MessageWriter<Hit>,
 ) {
     let dt = time.delta_secs();
-    if run.dead_t.is_some() || dt <= 0.0 {
+    if dt <= 0.0 {
         return;
     }
-    let Ok((me, htf)) = hero.single() else { return };
-    let hpos = htf.translation;
-    let stats = run.stats();
-    let now = run.elapsed;
-    let mut foes: Vec<Foe> = enemies
-        .iter()
-        .filter(|(_, _, e)| !e.dead)
-        .map(|(e, tf, en)| Foe {
-            e,
-            pos: tf.translation,
-            hp: en.hp,
-            dist: hero::reach(hpos, tf.translation),
-            radius: en.radius,
-        })
-        .collect();
-    foes.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+    let now = run.match_state.elapsed;
     let speed_of = |spell: u32| {
         spells
             .as_deref()
@@ -232,303 +229,338 @@ pub(super) fn cast_abilities(
             .map_or(0.0, |d| d.speed)
     };
 
-    for i in 0..run.abilities.len() {
-        run.abilities[i].cd -= dt;
-        if run.abilities[i].cd > 0.0 {
+    for (me, htf, ph) in &hero {
+        let Some(p_idx) = run
+            .players
+            .iter()
+            .position(|p| p.id == ph.0 && p.dead_t.is_none())
+        else {
             continue;
-        }
-        let o = &run.abilities[i];
-        let def = o.def;
-        let mult = o.damage_mult() * stats.might;
-        let p = Params {
-            dmg: def.damage * mult,
-            dot: def.dot * mult,
-            count: o.count() as usize,
-            radius: o.radius(&stats),
-            duration: o.duration(),
-            cooldown: o.cooldown(&stats),
         };
-        let speed = speed_of(def.spell);
-        let fired = match def.kind {
-            Kind::Bolt | Kind::Strike | Kind::Melee => {
-                let reach = if def.kind == Kind::Melee {
-                    def.range + 0.5
-                } else {
-                    def.range
-                };
-                let targets = if matches!(
-                    def.key,
-                    "pyroblast" | "aimed_shot" | "exorcism" | "starfire"
-                ) {
-                    toughest(&foes, reach, p.count)
-                } else {
-                    nearest(&foes, reach, p.count)
-                };
-                if targets.is_empty() {
-                    false
-                } else {
-                    if def.kind == Kind::Melee {
-                        fx.swing(me, targets[0].e, p.dmg);
-                        for f in &targets {
-                            fx.impact(f.e, def.spell);
-                        }
+        let pid = ph.0;
+        let hpos = htf.translation;
+        let stats = run.players[p_idx].stats();
+        let mut foes: Vec<Foe> = enemies
+            .iter()
+            .filter(|(_, _, e)| !e.dead)
+            .map(|(e, tf, en)| Foe {
+                e,
+                pos: tf.translation,
+                hp: en.hp,
+                dist: hero::reach(hpos, tf.translation),
+                radius: en.radius,
+            })
+            .collect();
+        foes.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+
+        let ability_count = run.players[p_idx].abilities.len();
+        for i in 0..ability_count {
+            run.players[p_idx].abilities[i].cd -= dt;
+            if run.players[p_idx].abilities[i].cd > 0.0 {
+                continue;
+            }
+            let (def, p) = {
+                let o = &run.players[p_idx].abilities[i];
+                let mult = o.damage_mult() * stats.might;
+                (
+                    o.def,
+                    Params {
+                        dmg: o.def.damage * mult,
+                        dot: o.def.dot * mult,
+                        count: o.count() as usize,
+                        radius: o.radius(&stats),
+                        duration: o.duration(),
+                        cooldown: o.cooldown(&stats),
+                    },
+                )
+            };
+            let speed = speed_of(def.spell);
+            let fired = match def.kind {
+                Kind::Bolt | Kind::Strike | Kind::Melee => {
+                    let reach = if def.kind == Kind::Melee {
+                        def.range + 0.5
                     } else {
-                        fx.cast(me, def.spell, &entities(&targets), None);
-                    }
-                    for f in &targets {
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
-                        let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
-                        schedule(
-                            &mut pending,
-                            &mut hits,
-                            now,
-                            delay,
-                            hit_for(def, &p, f.e, dmg, crit),
-                        );
-                    }
-                    true
-                }
-            }
-            Kind::Nova | Kind::Cone => {
-                let mut targets = around(&foes, hpos, p.radius);
-                if def.kind == Kind::Cone {
-                    if let Some(first) = targets.first().copied() {
-                        let aim = flat(first.pos - hpos).normalize_or_zero();
-                        targets.retain(|f| {
-                            let d = flat(f.pos - hpos);
-                            d.length() < 2.0 || d.normalize_or_zero().dot(aim) >= 0.8
-                        });
-                    }
-                }
-                if targets.is_empty() {
-                    false
-                } else {
-                    fx.cast(me, def.spell, &entities(&targets), None);
-                    for f in &targets {
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
-                        let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
-                        schedule(
-                            &mut pending,
-                            &mut hits,
-                            now,
-                            delay,
-                            hit_for(def, &p, f.e, dmg, crit),
-                        );
-                    }
-                    true
-                }
-            }
-            Kind::Ground | Kind::GroundSelf => {
-                let center = if def.kind == Kind::GroundSelf {
-                    foes.first()
-                        .filter(|f| f.dist <= p.radius + 4.0)
-                        .map(|_| hpos)
-                } else {
-                    densest(&foes, def.range, p.radius)
-                };
-                match center {
-                    None => false,
-                    Some(center) => {
-                        fx.cast(me, def.spell, &[], Some(center));
-                        let area = if def.overhead {
-                            commands
-                                .spawn((Transform::from_translation(center), RunEntity))
-                                .id()
+                        def.range
+                    };
+                    let targets = if matches!(
+                        def.key,
+                        "pyroblast" | "aimed_shot" | "exorcism" | "starfire"
+                    ) {
+                        toughest(&foes, reach, p.count)
+                    } else {
+                        nearest(&foes, reach, p.count)
+                    };
+                    if targets.is_empty() {
+                        false
+                    } else {
+                        if def.kind == Kind::Melee {
+                            fx.swing(me, targets[0].e, p.dmg);
+                            for f in &targets {
+                                fx.impact(f.e, def.spell);
+                            }
                         } else {
-                            let serial = run.guid();
-                            units::spawn_area_object(
-                                &mut commands,
-                                serial,
-                                def.spell,
-                                p.radius,
-                                center,
-                            )
-                        };
-                        let burst = def.duration <= 0.0;
-                        commands.entity(area).insert(GroundArea {
-                            damage: p.dmg,
-                            dot: p.dot,
-                            dot_dur: if burst { 5.0 } else { 0.0 },
-                            radius: p.radius,
-                            left: if burst { 1.5 } else { p.duration },
-                            every: if burst { f32::INFINITY } else { 1.0 },
-                            next_tick: if burst { 0.0 } else { 0.4 },
-                            effect: def.effect,
-                            mark: def.mark,
-                            impact: if def.overhead { def.spell } else { 0 },
-                        });
+                            fx.cast(me, def.spell, &entities(&targets), None);
+                        }
+                        for f in &targets {
+                            let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
+                            let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
+                            schedule(
+                                &mut pending,
+                                &mut hits,
+                                now,
+                                delay,
+                                hit_for(pid, def, &p, f.e, dmg, crit),
+                            );
+                        }
                         true
                     }
                 }
-            }
-            Kind::Chain => match nearest(&foes, def.range, 1).first().copied() {
-                None => false,
-                Some(first) => {
-                    let mut chain = vec![first];
-                    while chain.len() < p.count + 1 {
-                        let last = chain[chain.len() - 1].pos;
-                        let next = foes
-                            .iter()
-                            .filter(|f| !chain.iter().any(|c| c.e == f.e))
-                            .filter(|f| flat(f.pos - last).length() <= p.radius)
-                            .min_by(|a, b| {
-                                flat(a.pos - last)
-                                    .length()
-                                    .total_cmp(&flat(b.pos - last).length())
+                Kind::Nova | Kind::Cone => {
+                    let mut targets = around(&foes, hpos, p.radius);
+                    if def.kind == Kind::Cone {
+                        if let Some(first) = targets.first().copied() {
+                            let aim = flat(first.pos - hpos).normalize_or_zero();
+                            targets.retain(|f| {
+                                let d = flat(f.pos - hpos);
+                                d.length() < 2.0 || d.normalize_or_zero().dot(aim) >= 0.8
                             });
-                        match next {
-                            Some(f) => chain.push(*f),
-                            None => break,
                         }
                     }
-                    fx.cast(me, def.spell, &entities(&chain), None);
-                    for (k, f) in chain.iter().enumerate() {
-                        let (dmg, crit) =
-                            roll(&mut rng, stats.crit, p.dmg * 0.85f32.powi(k as i32));
-                        schedule(
-                            &mut pending,
-                            &mut hits,
-                            now,
-                            0.08 * k as f32,
-                            hit_for(def, &p, f.e, dmg, crit),
+                    if targets.is_empty() {
+                        false
+                    } else {
+                        fx.cast(me, def.spell, &entities(&targets), None);
+                        for f in &targets {
+                            let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
+                            let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
+                            schedule(
+                                &mut pending,
+                                &mut hits,
+                                now,
+                                delay,
+                                hit_for(pid, def, &p, f.e, dmg, crit),
+                            );
+                        }
+                        true
+                    }
+                }
+                Kind::Ground | Kind::GroundSelf => {
+                    let center = if def.kind == Kind::GroundSelf {
+                        foes.first()
+                            .filter(|f| f.dist <= p.radius + 4.0)
+                            .map(|_| hpos)
+                    } else {
+                        densest(&foes, def.range, p.radius)
+                    };
+                    match center {
+                        None => false,
+                        Some(center) => {
+                            fx.cast(me, def.spell, &[], Some(center));
+                            let area = if def.overhead {
+                                commands
+                                    .spawn((Transform::from_translation(center), RunEntity))
+                                    .id()
+                            } else {
+                                let serial = run.guid();
+                                units::spawn_area_object(
+                                    &mut commands,
+                                    serial,
+                                    def.spell,
+                                    p.radius,
+                                    center,
+                                )
+                            };
+                            let burst = def.duration <= 0.0;
+                            commands.entity(area).insert(GroundArea {
+                                owner: pid,
+                                damage: p.dmg,
+                                dot: p.dot,
+                                dot_dur: if burst { 5.0 } else { 0.0 },
+                                radius: p.radius,
+                                left: if burst { 1.5 } else { p.duration },
+                                every: if burst { f32::INFINITY } else { 1.0 },
+                                next_tick: if burst { 0.0 } else { 0.4 },
+                                effect: def.effect,
+                                mark: def.mark,
+                                impact: if def.overhead { def.spell } else { 0 },
+                            });
+                            true
+                        }
+                    }
+                }
+                Kind::Chain => match nearest(&foes, def.range, 1).first().copied() {
+                    None => false,
+                    Some(first) => {
+                        let mut chain = vec![first];
+                        while chain.len() < p.count + 1 {
+                            let last = chain[chain.len() - 1].pos;
+                            let next = foes
+                                .iter()
+                                .filter(|f| !chain.iter().any(|c| c.e == f.e))
+                                .filter(|f| flat(f.pos - last).length() <= p.radius)
+                                .min_by(|a, b| {
+                                    flat(a.pos - last)
+                                        .length()
+                                        .total_cmp(&flat(b.pos - last).length())
+                                });
+                            match next {
+                                Some(f) => chain.push(*f),
+                                None => break,
+                            }
+                        }
+                        fx.cast(me, def.spell, &entities(&chain), None);
+                        for (k, f) in chain.iter().enumerate() {
+                            let (dmg, crit) =
+                                roll(&mut rng, stats.crit, p.dmg * 0.85f32.powi(k as i32));
+                            schedule(
+                                &mut pending,
+                                &mut hits,
+                                now,
+                                0.08 * k as f32,
+                                hit_for(pid, def, &p, f.e, dmg, crit),
+                            );
+                        }
+                        true
+                    }
+                },
+                Kind::Dot => {
+                    let mut pool: Vec<Foe> = foes
+                        .iter()
+                        .filter(|f| f.dist <= def.range)
+                        .take(p.count * 3)
+                        .copied()
+                        .collect();
+                    if pool.is_empty() {
+                        false
+                    } else {
+                        let mut targets = Vec::with_capacity(p.count);
+                        while targets.len() < p.count && !pool.is_empty() {
+                            targets.push(pool.swap_remove(rng.index(pool.len())));
+                        }
+                        fx.cast(me, def.spell, &entities(&targets), None);
+                        for f in &targets {
+                            let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
+                            schedule(
+                                &mut pending,
+                                &mut hits,
+                                now,
+                                delay,
+                                hit_for(pid, def, &p, f.e, 0.0, false),
+                            );
+                        }
+                        true
+                    }
+                }
+                Kind::Aura => {
+                    let targets = around(&foes, hpos, p.radius);
+                    if targets.is_empty() {
+                        false
+                    } else {
+                        for f in targets.iter().take(6) {
+                            fx.impact(f.e, def.spell);
+                        }
+                        for f in &targets {
+                            let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
+                            hits.write(hit_for(pid, def, &p, f.e, dmg, crit));
+                        }
+                        true
+                    }
+                }
+                Kind::Orbit => {
+                    let targets = nearest(&foes, p.radius, p.count);
+                    if targets.is_empty() {
+                        false
+                    } else {
+                        for f in &targets {
+                            fx.impact(f.e, 403);
+                            let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
+                            hits.write(hit_for(pid, def, &p, f.e, dmg, crit));
+                        }
+                        true
+                    }
+                }
+                Kind::Shield => {
+                    let player = &mut run.players[p_idx];
+                    player.shield = p.dmg;
+                    player.shield_t = p.duration;
+                    fx.cast(me, def.spell, &[me], None);
+                    true
+                }
+                Kind::Immune => {
+                    if foes.first().is_some_and(|f| f.dist <= 5.0) {
+                        run.players[p_idx].immune_t = p.duration;
+                        fx.cast(me, def.spell, &[me], None);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Kind::Thorns => {
+                    if foes.first().is_some_and(|f| f.dist <= 8.0) {
+                        let player = &mut run.players[p_idx];
+                        player.thorns = p.dmg;
+                        player.thorns_t = p.duration;
+                        player.thorns_spell = def.spell;
+                        fx.cast(me, def.spell, &[me], None);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Kind::Heal => {
+                    let player = &mut run.players[p_idx];
+                    if player.hp < stats.max_hp * 0.85 {
+                        player.heal_rate = p.dmg / p.duration.max(1.0);
+                        player.heal_t = p.duration;
+                        fx.cast(me, def.spell, &[me], None);
+                        fx.number(me, p.dmg, false, COLOR_HEAL);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Kind::Totem => {
+                    if foes
+                        .first()
+                        .is_some_and(|f| f.dist <= def.range.max(p.radius) + 6.0)
+                    {
+                        fx.cast(me, def.spell, &[], None);
+                        let a = rng.range(0.0, std::f32::consts::TAU);
+                        let pos = hpos + Vec3::new(a.cos(), 0.0, a.sin()) * 2.0;
+                        let serial = run.guid();
+                        let totem = units::spawn_unit(
+                            &mut commands,
+                            &UnitSpec {
+                                serial,
+                                display: def.totem.0,
+                                scale: 1.0,
+                                level: 60,
+                                faction: units::FACTION_FRIENDLY,
+                                bytes0: 0,
+                                weapons: &[],
+                                sheath: 0,
+                            },
+                            pos,
+                            0.0,
                         );
+                        commands.entity(totem).insert(Totem {
+                            owner: pid,
+                            cast: def.totem.1,
+                            damage: p.dmg,
+                            range: def.range,
+                            radius: p.radius,
+                            left: p.duration,
+                            tick: 0.3,
+                            pulse: def.key == "magma_totem",
+                        });
+                        true
+                    } else {
+                        false
                     }
-                    true
                 }
-            },
-            Kind::Dot => {
-                let mut pool: Vec<Foe> = foes
-                    .iter()
-                    .filter(|f| f.dist <= def.range)
-                    .take(p.count * 3)
-                    .copied()
-                    .collect();
-                if pool.is_empty() {
-                    false
-                } else {
-                    let mut targets = Vec::with_capacity(p.count);
-                    while targets.len() < p.count && !pool.is_empty() {
-                        targets.push(pool.swap_remove(rng.index(pool.len())));
-                    }
-                    fx.cast(me, def.spell, &entities(&targets), None);
-                    for f in &targets {
-                        let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
-                        schedule(
-                            &mut pending,
-                            &mut hits,
-                            now,
-                            delay,
-                            hit_for(def, &p, f.e, 0.0, false),
-                        );
-                    }
-                    true
-                }
-            }
-            Kind::Aura => {
-                let targets = around(&foes, hpos, p.radius);
-                if targets.is_empty() {
-                    false
-                } else {
-                    for f in targets.iter().take(6) {
-                        fx.impact(f.e, def.spell);
-                    }
-                    for f in &targets {
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
-                        hits.write(hit_for(def, &p, f.e, dmg, crit));
-                    }
-                    true
-                }
-            }
-            Kind::Orbit => {
-                let targets = nearest(&foes, p.radius, p.count);
-                if targets.is_empty() {
-                    false
-                } else {
-                    for f in &targets {
-                        fx.impact(f.e, 403);
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
-                        hits.write(hit_for(def, &p, f.e, dmg, crit));
-                    }
-                    true
-                }
-            }
-            Kind::Shield => {
-                run.shield = p.dmg;
-                run.shield_t = p.duration;
-                fx.cast(me, def.spell, &[me], None);
-                true
-            }
-            Kind::Immune => {
-                if foes.first().is_some_and(|f| f.dist <= 5.0) {
-                    run.immune_t = p.duration;
-                    fx.cast(me, def.spell, &[me], None);
-                    true
-                } else {
-                    false
-                }
-            }
-            Kind::Thorns => {
-                if foes.first().is_some_and(|f| f.dist <= 8.0) {
-                    run.thorns = p.dmg;
-                    run.thorns_t = p.duration;
-                    run.thorns_spell = def.spell;
-                    fx.cast(me, def.spell, &[me], None);
-                    true
-                } else {
-                    false
-                }
-            }
-            Kind::Heal => {
-                if run.hp < stats.max_hp * 0.85 {
-                    run.heal_rate = p.dmg / p.duration.max(1.0);
-                    run.heal_t = p.duration;
-                    fx.cast(me, def.spell, &[me], None);
-                    fx.number(me, p.dmg, false, COLOR_HEAL);
-                    true
-                } else {
-                    false
-                }
-            }
-            Kind::Totem => {
-                if foes
-                    .first()
-                    .is_some_and(|f| f.dist <= def.range.max(p.radius) + 6.0)
-                {
-                    fx.cast(me, def.spell, &[], None);
-                    let a = rng.range(0.0, std::f32::consts::TAU);
-                    let pos = hpos + Vec3::new(a.cos(), 0.0, a.sin()) * 2.0;
-                    let serial = run.guid();
-                    let totem = units::spawn_unit(
-                        &mut commands,
-                        &UnitSpec {
-                            serial,
-                            display: def.totem.0,
-                            scale: 1.0,
-                            level: 60,
-                            faction: units::FACTION_FRIENDLY,
-                            bytes0: 0,
-                            weapons: &[],
-                            sheath: 0,
-                        },
-                        pos,
-                        0.0,
-                    );
-                    commands.entity(totem).insert(Totem {
-                        cast: def.totem.1,
-                        damage: p.dmg,
-                        range: def.range,
-                        radius: p.radius,
-                        left: p.duration,
-                        tick: 0.3,
-                        pulse: def.key == "magma_totem",
-                    });
-                    true
-                } else {
-                    false
-                }
-            }
-        };
-        run.abilities[i].cd = if fired { p.cooldown } else { 0.2 };
+            };
+            run.players[p_idx].abilities[i].cd = if fired { p.cooldown } else { 0.2 };
+        }
     }
 }
 
@@ -551,8 +583,7 @@ pub(super) fn tick_areas(
     if dt <= 0.0 {
         return;
     }
-    let stats = run.stats();
-    let now = run.elapsed;
+    let now = run.match_state.elapsed;
     let live: Vec<Foe> = enemies
         .iter()
         .filter(|(_, _, e)| !e.dead)
@@ -570,6 +601,7 @@ pub(super) fn tick_areas(
         area.next_tick -= dt;
         if area.next_tick <= 0.0 {
             area.next_tick += area.every;
+            let crit_chance = run.player(area.owner).map_or(0.05, |p| p.stats().crit);
             for (i, f) in around(&live, tf.translation, area.radius)
                 .into_iter()
                 .enumerate()
@@ -577,8 +609,9 @@ pub(super) fn tick_areas(
                 if area.impact != 0 && i < 12 {
                     fx.impact(f.e, area.impact);
                 }
-                let (dmg, crit) = roll(&mut rng, stats.crit, area.damage);
+                let (dmg, crit) = roll(&mut rng, crit_chance, area.damage);
                 hits.write(Hit {
+                    source: area.owner,
                     target: f.e,
                     damage: dmg,
                     dot: area.dot,
@@ -611,6 +644,7 @@ pub(super) fn tick_areas(
             continue;
         }
         let pos = tf.translation;
+        let crit_chance = run.player(totem.owner).map_or(0.05, |p| p.stats().crit);
         if totem.pulse {
             let targets = around(&live, pos, totem.radius);
             totem.tick = 2.0;
@@ -619,10 +653,10 @@ pub(super) fn tick_areas(
             }
             fx.cast(e, totem.cast, &[], None);
             for f in &targets {
-                let (dmg, crit) = roll(&mut rng, stats.crit, totem.damage);
+                let (dmg, crit) = roll(&mut rng, crit_chance, totem.damage);
                 hits.write(Hit {
                     color: COLOR_SPELL,
-                    ..Hit::direct(f.e, dmg, crit)
+                    ..Hit::direct(f.e, dmg, crit, totem.owner)
                 });
             }
         } else {
@@ -639,7 +673,7 @@ pub(super) fn tick_areas(
                 .and_then(|s| s.catalog.get(totem.cast))
                 .map_or(0.0, |d| d.speed);
             let delay = if speed > 0.0 { dist / speed } else { 0.0 };
-            let (dmg, crit) = roll(&mut rng, stats.crit, totem.damage);
+            let (dmg, crit) = roll(&mut rng, crit_chance, totem.damage);
             schedule(
                 &mut pending,
                 &mut hits,
@@ -647,7 +681,7 @@ pub(super) fn tick_areas(
                 delay,
                 Hit {
                     color: COLOR_SPELL,
-                    ..Hit::direct(f.e, dmg, crit)
+                    ..Hit::direct(f.e, dmg, crit, totem.owner)
                 },
             );
         }
@@ -675,7 +709,7 @@ pub(super) fn apply_hits(
     mut fields: MessageWriter<FieldChanged>,
 ) {
     let dt = time.delta_secs();
-    let now = run.elapsed;
+    let now = run.match_state.elapsed;
     let mut due: Vec<Hit> = incoming.read().cloned().collect();
     pending.0.retain(|(t, h)| {
         if *t <= now {
@@ -708,22 +742,28 @@ pub(super) fn apply_hits(
         all.push(Hit { splash: 0.0, ..h });
     }
 
-    let mut kill =
-        |commands: &mut Commands, run: &mut Run, e: Entity, pos: Vec3, en: &mut Enemy| {
-            en.dead = true;
-            en.hp = 0.0;
-            en.dots.clear();
-            enemies::mark_dying(commands, e);
-            loot.write(Loot {
-                pos,
-                xp: en.xp,
-                boss: en.boss,
-            });
-            run.kills += 1;
-            if en.boss {
-                run.banner = Some((format!("{} is slain!", en.def.name), 3.0));
-            }
-        };
+    let mut kill = |commands: &mut Commands,
+                    run: &mut Run,
+                    source: PlayerId,
+                    e: Entity,
+                    pos: Vec3,
+                    en: &mut Enemy| {
+        en.dead = true;
+        en.hp = 0.0;
+        en.dots.clear();
+        enemies::mark_dying(commands, e);
+        loot.write(Loot {
+            pos,
+            xp: en.xp,
+            boss: en.boss,
+        });
+        if let Some(p) = run.player_mut(source) {
+            p.kills += 1;
+        }
+        if en.boss {
+            run.match_state.banner = Some((format!("{} is slain!", en.def.name), 3.0));
+        }
+    };
 
     for h in all {
         let Ok((e, guid, tf, mut en, mut store, mut marks)) = enemies.get_mut(h.target) else {
@@ -740,11 +780,13 @@ pub(super) fn apply_hits(
         }
         if dmg > 0.0 {
             en.hp -= dmg;
-            run.damage_done += f64::from(dmg);
             fx.number(e, dmg, h.crit, h.color);
-            if let Effect::Drain(frac) = h.effect {
-                let max = run.stats().max_hp;
-                run.hp = (run.hp + dmg * frac).min(max);
+            if let Some(p) = run.player_mut(h.source) {
+                p.damage_done += f64::from(dmg);
+                if let Effect::Drain(frac) = h.effect {
+                    let max = p.stats().max_hp;
+                    p.hp = (p.hp + dmg * frac).min(max);
+                }
             }
         }
         if h.dot > 0.0 && h.dot_dur > 0.0 {
@@ -752,6 +794,7 @@ pub(super) fn apply_hits(
                 en.dots.remove(0);
             }
             en.dots.push(enemies::Dot {
+                source: h.source,
                 dps: h.dot,
                 left: h.dot_dur,
                 tick: 1.0,
@@ -777,7 +820,14 @@ pub(super) fn apply_hits(
             marks.add(h.mark, h.mark_dur);
         }
         if en.hp <= 0.0 {
-            kill(&mut commands, &mut run, e, tf.translation, &mut en);
+            kill(
+                &mut commands,
+                &mut run,
+                h.source,
+                e,
+                tf.translation,
+                &mut en,
+            );
             units::kill_unit(&mut store);
             marks.clear();
         }
@@ -790,21 +840,25 @@ pub(super) fn apply_hits(
             continue;
         }
         let mut dealt = 0.0;
+        let mut killer = PlayerId(0);
         for d in &mut en.dots {
             d.left -= dt;
             d.tick -= dt;
             if d.tick <= 0.0 {
                 d.tick += 1.0;
                 dealt += d.dps;
+                killer = d.source;
+                if let Some(p) = run.player_mut(d.source) {
+                    p.damage_done += f64::from(d.dps);
+                }
             }
         }
         en.dots.retain(|d| d.left > 0.0);
         if dealt > 0.0 {
             en.hp -= dealt;
-            run.damage_done += f64::from(dealt);
             fx.number(e, dealt, false, COLOR_SPELL);
             if en.hp <= 0.0 {
-                kill(&mut commands, &mut run, e, tf.translation, &mut en);
+                kill(&mut commands, &mut run, killer, e, tf.translation, &mut en);
                 units::kill_unit(&mut store);
                 marks.clear();
                 marks.flush(e, guid.0, &mut store, &mut fields);

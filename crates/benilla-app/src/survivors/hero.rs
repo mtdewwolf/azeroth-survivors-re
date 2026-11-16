@@ -1,4 +1,4 @@
-//! The hero: its body, WASD movement over the terrain, the top-down camera, and its health.
+//! The hero: its body, input collection, movement over the terrain, top-down camera, and health.
 
 use benilla_world::view::WorldCamera;
 use benilla_world::world_point::WorldPoint;
@@ -6,6 +6,7 @@ use bevy::input::mouse::{AccumulatedMouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
 use super::data::{self, ClassDef};
+use super::state::{PlayerHero, PlayerId, PlayerInput, PlayerInputs, PlayerState};
 use super::units::{self, flat, wow_to_bevy, yaw_toward, Fx, Marks, UnitSpec};
 use super::{Phase, Run, Selection};
 use crate::creature_anim::{move_flags, MovementState};
@@ -94,8 +95,10 @@ pub(super) fn follow_map(
 }
 
 /// The hero in the class trainer's look, weapons drawn.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_hero(
     commands: &mut Commands,
+    player_id: PlayerId,
     class: &'static ClassDef,
     display: u32,
     race: u8,
@@ -122,9 +125,11 @@ pub(super) fn spawn_hero(
         pos,
         0.0,
     );
-    commands
-        .entity(e)
-        .insert((Hero { vy: 0.0, air: 0.0 }, Marks::buffs()));
+    commands.entity(e).insert((
+        Hero { vy: 0.0, air: 0.0 },
+        PlayerHero(player_id),
+        Marks::buffs(),
+    ));
     e
 }
 
@@ -144,22 +149,28 @@ pub(super) fn daylight(debug: Option<ResMut<benilla_world::dev_state::DebugState
 #[derive(Resource, Default)]
 pub(super) struct AimPoint(pub(super) Option<Vec3>);
 
-/// Cast the cursor onto the terrain: the camera ray meets the plane at the hero's height, then the
-/// terrain height there, a few times over, which settles on hills within a frame.
+/// Cast the cursor onto the terrain: the camera ray meets the plane at the local hero's height,
+/// then the terrain height there, a few times over, which settles on hills within a frame.
 pub(super) fn aim_cursor(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     cams: Query<(&Camera, &Transform), With<WorldCamera>>,
-    hero: Query<&Transform, (With<Hero>, Without<WorldCamera>)>,
+    run: Res<Run>,
+    heroes: Query<(&Transform, &PlayerHero), (With<Hero>, Without<WorldCamera>)>,
     world: WorldPoint,
     mut aim: ResMut<AimPoint>,
 ) {
+    let local_tf = heroes
+        .iter()
+        .find(|(_, ph)| ph.0 == run.local)
+        .or_else(|| heroes.iter().next())
+        .map(|(tf, _)| tf);
     let point = (|| {
         let cursor = windows.single().ok()?.cursor_position()?;
         let (cam, tf) = cams.single().ok()?;
         let ray = cam
             .viewport_to_world(&GlobalTransform::from(*tf), cursor)
             .ok()?;
-        let mut y = hero.single().ok()?.translation.y;
+        let mut y = local_tf?.translation.y;
         let mut at = None;
         for _ in 0..4 {
             if ray.direction.y.abs() < 1e-4 {
@@ -183,145 +194,220 @@ pub(super) fn aim_cursor(
     }
 }
 
-/// WASD over the terrain within the battleground's leash, and the streaming focus on the hero.
+/// Capture local keyboard, mouse, touch, or autopilot commands into [`PlayerInputs`] for
+/// `run.local`, isolating device polling from hero movement and mobility systems.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn drive_hero(
-    time: Res<Time>,
+pub(super) fn collect_local_input(
     keys: Res<ButtonInput<KeyCode>>,
     phase: Res<State<Phase>>,
     run: Res<Run>,
-    selection: Res<Selection>,
     rig: Res<CamRig>,
     aim: Res<AimPoint>,
-    world: WorldPoint,
     auto: Option<Res<super::auto::Auto>>,
     #[cfg(target_os = "android")] touch: Res<super::touch::TouchControls>,
-    mut player: ResMut<crate::player::Player>,
-    mut hero: Query<(&mut Transform, &mut MovementState, &mut Hero)>,
+    heroes: Query<(&Transform, &PlayerHero), With<Hero>>,
+    mut inputs: ResMut<PlayerInputs>,
 ) {
-    let focus = match hero.single_mut() {
-        Ok((mut tf, mut mv, mut hm)) => {
-            let dt = time.delta_secs();
-            let mut dir = Vec3::ZERO;
-            if let Some(auto) = auto
-                .as_deref()
-                .filter(|_| *phase.get() == Phase::Playing && run.dead_t.is_none())
-            {
-                dir = super::auto::steer(auto);
-            } else if *phase.get() == Phase::Playing && run.dead_t.is_none() {
-                if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
-                    dir.z -= 1.0;
+    let local_id = run.local;
+    if *phase.get() != Phase::Playing || run.local().dead_t.is_some() {
+        inputs.set(local_id, PlayerInput::default());
+        return;
+    }
+
+    let hero_pos = heroes
+        .iter()
+        .find(|(_, ph)| ph.0 == local_id)
+        .map(|(tf, _)| tf.translation);
+
+    let mut dir = Vec3::ZERO;
+    if let Some(auto) = auto.as_deref() {
+        dir = super::auto::steer(auto);
+    } else {
+        if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
+            dir.z -= 1.0;
+        }
+        if keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown]) {
+            dir.z += 1.0;
+        }
+        if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
+            dir.x -= 1.0;
+        }
+        if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
+            dir.x += 1.0;
+        }
+        if dir != Vec3::ZERO {
+            dir = dir.normalize();
+        }
+        #[cfg(target_os = "android")]
+        if touch.direction != Vec2::ZERO {
+            let clamped = touch.direction.clamp_length_max(1.0);
+            dir = Vec3::new(clamped.x, 0.0, clamped.y);
+        }
+        if rig.mode == CamMode::Orbit && dir != Vec3::ZERO {
+            let (sy, cy) = rig.yaw.sin_cos();
+            dir = Vec3::new(dir.x * cy + dir.z * sy, 0.0, dir.z * cy - dir.x * sy);
+        }
+    }
+
+    let face = if rig.mode == CamMode::Fixed && auto.is_none() {
+        #[cfg(target_os = "android")]
+        let suppress_face = touch.direction != Vec2::ZERO;
+        #[cfg(not(target_os = "android"))]
+        let suppress_face = false;
+
+        if suppress_face {
+            None
+        } else {
+            hero_pos.and_then(|pos| {
+                aim.0
+                    .map(|a| flat(a - pos))
+                    .filter(|d| d.length() > 0.5)
+                    .map(|d| d.normalize())
+            })
+        }
+    } else {
+        None
+    };
+
+    let jump = keys.just_pressed(KeyCode::Space);
+    #[cfg(target_os = "android")]
+    let jump = jump || touch.jump;
+
+    let mobility = keys.just_pressed(super::mobility::KEY);
+    #[cfg(target_os = "android")]
+    let mobility = mobility || touch.mobility;
+
+    #[cfg(target_os = "android")]
+    let mobility_aim = if touch.mobility {
+        hero_pos.and_then(|pos| {
+            Vec3::new(touch.direction.x, 0.0, touch.direction.y)
+                .try_normalize()
+                .map(|d| pos + d * 100.0)
+        })
+    } else {
+        aim.0
+    };
+    #[cfg(not(target_os = "android"))]
+    let mobility_aim = aim.0;
+
+    inputs.set(
+        local_id,
+        PlayerInput {
+            move_dir: Vec2::new(dir.x, dir.z),
+            look_dir: face,
+            jump,
+            mobility,
+            mobility_aim,
+        },
+    );
+}
+
+/// Drive every hero from [`PlayerInputs`] over the terrain within the battleground's leash,
+/// and keep the streaming focus on the local hero.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_hero(
+    time: Res<Time>,
+    phase: Res<State<Phase>>,
+    run: Res<Run>,
+    inputs: Res<PlayerInputs>,
+    selection: Res<Selection>,
+    world: WorldPoint,
+    mut player: ResMut<crate::player::Player>,
+    mut heroes: Query<(&mut Transform, &mut MovementState, &mut Hero, &PlayerHero)>,
+) {
+    let dt = time.delta_secs();
+    let in_menu = *phase.get() == Phase::Menu;
+    let map = if in_menu {
+        selection.stage_def()
+    } else {
+        run.match_state.config.map
+    };
+    let center = arena(map);
+    let mut local_focus = None;
+
+    for (mut tf, mut mv, mut hm, player_hero) in &mut heroes {
+        let state = run.player(player_hero.0).unwrap_or_else(|| run.local());
+        let playing = *phase.get() == Phase::Playing && state.dead_t.is_none();
+        let input = if playing {
+            inputs.get(player_hero.0)
+        } else {
+            PlayerInput::default()
+        };
+
+        let mut pos = tf.translation;
+        let face = if playing { input.look_dir } else { None };
+        if let Some(look) = face {
+            let target = Quat::from_rotation_y(yaw_toward(look));
+            tf.rotation = tf.rotation.slerp(target, (dt * 20.0).min(1.0));
+        }
+
+        let move_len = input.move_dir.length();
+        if move_len > 1e-4 && dt > 0.0 {
+            let dir = Vec3::new(
+                input.move_dir.x / move_len,
+                0.0,
+                input.move_dir.y / move_len,
+            );
+            let speed = state.stats().speed * state.haste_mult() * move_len.min(1.0);
+            pos += dir * speed * dt;
+            mv.speed = speed;
+            mv.flags = match face {
+                Some(look) => gait(look, dir),
+                None => {
+                    let target = Quat::from_rotation_y(yaw_toward(dir));
+                    tf.rotation = tf.rotation.slerp(target, (dt * 20.0).min(1.0));
+                    move_flags::FORWARD
                 }
-                if keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown]) {
-                    dir.z += 1.0;
-                }
-                if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
-                    dir.x -= 1.0;
-                }
-                if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
-                    dir.x += 1.0;
-                }
-                #[cfg(target_os = "android")]
-                if touch.direction != Vec2::ZERO {
-                    dir = Vec3::new(touch.direction.x, 0.0, touch.direction.y);
-                }
-                // In orbit mode WASD is camera-relative; in fixed mode it stays world-relative.
-                if rig.mode == CamMode::Orbit {
-                    let (sy, cy) = rig.yaw.sin_cos();
-                    dir = Vec3::new(dir.x * cy + dir.z * sy, 0.0, dir.z * cy - dir.x * sy);
-                }
-            }
-            let mut pos = tf.translation;
-            // Locked, the hero faces the cursor and WASD moves him under it, so he backpedals and
-            // strafes as a player does; unlocked (or driven), he faces where he runs.
-            let face = (rig.mode == CamMode::Fixed
-                && auto.is_none()
-                && *phase.get() == Phase::Playing
-                && run.dead_t.is_none())
-            .then(|| aim.0.map(|a| flat(a - pos)))
-            .flatten()
-            .filter(|d| d.length() > 0.5)
-            .map(|d| d.normalize());
-            #[cfg(target_os = "android")]
-            let face = face.filter(|_| touch.direction == Vec2::ZERO);
-            if let Some(look) = face {
-                let target = Quat::from_rotation_y(yaw_toward(look));
-                tf.rotation = tf.rotation.slerp(target, (dt * 20.0).min(1.0));
-            }
-            if dir != Vec3::ZERO && dt > 0.0 {
-                let dir = dir.normalize();
-                let speed = run.stats().speed * run.haste_mult();
-                #[cfg(target_os = "android")]
-                let speed = if auto.is_none() && touch.direction != Vec2::ZERO {
-                    speed * touch.direction.length().min(1.0)
-                } else {
-                    speed
-                };
-                pos += dir * speed * dt;
-                mv.speed = speed;
-                mv.flags = match face {
-                    Some(look) => gait(look, dir),
-                    None => {
-                        let target = Quat::from_rotation_y(yaw_toward(dir));
-                        tf.rotation = tf.rotation.slerp(target, (dt * 20.0).min(1.0));
-                        move_flags::FORWARD
-                    }
-                };
-            } else if mv.speed != 0.0 || mv.flags != 0 {
-                mv.speed = 0.0;
-                mv.flags = 0;
-            }
-            let map = selection.stage_def();
-            let center = arena(map);
-            let off = flat(pos - center);
-            if off.length() > map.leash * 2.0 {
-                // Just entered another battleground: start at its centre.
-                pos = center;
-            } else if off.length() > map.leash {
-                let held = center + off.normalize() * map.leash;
-                pos.x = held.x;
-                pos.z = held.z;
-            }
-            let ground = world.terrain_height_under(pos).unwrap_or(pos.y);
-            let playing = *phase.get() == Phase::Playing && run.dead_t.is_none();
-            // Space hops: lift off the terrain, then gravity brings the hero back down.
-            let jump = keys.just_pressed(KeyCode::Space);
-            #[cfg(target_os = "android")]
-            let jump = jump || touch.jump;
-            if playing && jump && hm.vy == 0.0 && hm.air == 0.0 {
-                hm.vy = JUMP_SPEED;
-            }
-            if playing && (hm.vy != 0.0 || hm.air > 0.0) {
-                hm.vy -= GRAVITY * dt;
-                hm.air += hm.vy * dt;
-                if hm.air <= 0.0 {
-                    hm.air = 0.0;
-                    hm.vy = 0.0;
-                }
-            } else {
+            };
+        } else if mv.speed != 0.0 || mv.flags != 0 {
+            mv.speed = 0.0;
+            mv.flags = 0;
+        }
+
+        let off = flat(pos - center);
+        if off.length() > map.leash * 2.0 {
+            pos = center;
+        } else if off.length() > map.leash {
+            let held = center + off.normalize() * map.leash;
+            pos.x = held.x;
+            pos.z = held.z;
+        }
+        let ground = world.terrain_height_under(pos).unwrap_or(pos.y);
+
+        if playing && input.jump && hm.vy == 0.0 && hm.air == 0.0 {
+            hm.vy = JUMP_SPEED;
+        }
+        if playing && (hm.vy != 0.0 || hm.air > 0.0) {
+            hm.vy -= GRAVITY * dt;
+            hm.air += hm.vy * dt;
+            if hm.air <= 0.0 {
                 hm.air = 0.0;
                 hm.vy = 0.0;
             }
-            pos.y = ground + hm.air;
-            // Feed the animation driver: `vertical_speed`'s sign and the `FALLING` flag are what
-            // select the Jump (37/38) / Fall (40) animation (`creature_anim::select`).
-            mv.vertical_speed = hm.vy;
-            if hm.vy != 0.0 {
-                mv.flags |= move_flags::FALLING;
-            }
-            if tf.translation != pos {
-                tf.translation = pos;
-            }
-            pos
+        } else {
+            hm.air = 0.0;
+            hm.vy = 0.0;
         }
-        Err(_) => {
-            let mut p = arena(selection.stage_def());
-            if let Some(h) = world.terrain_height_under(p) {
-                p.y = h;
-            }
-            p
+        pos.y = ground + hm.air;
+        mv.vertical_speed = hm.vy;
+        if hm.vy != 0.0 {
+            mv.flags |= move_flags::FALLING;
         }
-    };
+        if tf.translation != pos {
+            tf.translation = pos;
+        }
+        if player_hero.0 == run.local || local_focus.is_none() {
+            local_focus = Some(pos);
+        }
+    }
+
+    let focus = local_focus.unwrap_or_else(|| {
+        let mut p = center;
+        if let Some(h) = world.terrain_height_under(p) {
+            p.y = h;
+        }
+        p
+    });
     // The terrain streams and the loading screen waits on the ground under this.
     player.active = true;
     player.detached = false;
@@ -330,11 +416,7 @@ pub(super) fn drive_hero(
     player.pos = focus;
 }
 
-/// Let go of the mouse buttons when the page loses focus or the pointer leaves it. A release that
-/// lands elsewhere (alt-tab mid-drag, a browser or OS popup) never reaches the game, so the button
-/// would read as held and the unlocked camera would swing with every move until both buttons were
-/// clicked again. Survivors only: the engine's mouse-look keeps its buttons across a deactivate,
-/// as 1.12.1 does.
+/// Let go of the mouse buttons when the page loses focus or the pointer leaves it.
 pub(super) fn drop_stray_buttons(
     mut focus: MessageReader<bevy::window::WindowFocused>,
     mut left: MessageReader<bevy::window::CursorLeft>,
@@ -347,9 +429,11 @@ pub(super) fn drop_stray_buttons(
 }
 
 /// A slow orbit at the menu; in play, top-down until `C` unlocks it to swing and tilt.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn place_camera(
     time: Res<Time<Real>>,
     phase: Res<State<Phase>>,
+    run: Res<Run>,
     mut rig: ResMut<CamRig>,
     mut wheel: MessageReader<MouseWheel>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -358,11 +442,9 @@ pub(super) fn place_camera(
     keys: Res<ButtonInput<KeyCode>>,
     player: Res<crate::player::Player>,
     world: WorldPoint,
-    hero: Query<&Transform, (With<Hero>, Without<WorldCamera>)>,
+    heroes: Query<(&Transform, &PlayerHero), (With<Hero>, Without<WorldCamera>)>,
     mut cams: Query<&mut Transform, With<WorldCamera>>,
 ) {
-    // `C` unlocks the camera to swing and tilt; locking it again snaps back to the top-down view,
-    // so world-relative WASD lines up with the screen again.
     if keys.just_pressed(KeyCode::KeyC) {
         rig.mode = match rig.mode {
             CamMode::Fixed => CamMode::Orbit,
@@ -373,10 +455,11 @@ pub(super) fn place_camera(
             }
         };
     }
-    // With no hero yet, the focus `drive_hero` grounded.
-    let focus = hero.single().map_or(player.pos, |t| t.translation);
-    // Multiplicative, so a notch moves as far by eye close in as far out; all the way down to an
-    // over-the-shoulder view.
+    let focus = heroes
+        .iter()
+        .find(|(_, ph)| ph.0 == run.local)
+        .or_else(|| heroes.iter().next())
+        .map_or(player.pos, |(t, _)| t.translation);
     for w in wheel.read() {
         let notches = match w.unit {
             MouseScrollUnit::Line => w.y,
@@ -396,7 +479,6 @@ pub(super) fn place_camera(
             focus + Vec3::Y * 1.1,
         )
     } else {
-        // Unlocked, either mouse button drags the camera around the hero, as in WoW.
         if rig.mode == CamMode::Orbit && mouse.any_pressed([MouseButton::Left, MouseButton::Right])
         {
             rig.yaw -= motion.delta.x * ORBIT_RATE;
@@ -406,7 +488,6 @@ pub(super) fn place_camera(
         let (sp, cp) = rig.pitch.sin_cos();
         let look = focus + Vec3::Y * 1.4;
         let mut eye = look + Vec3::new(cp * sy, sp, cp * cy) * rig.dist;
-        // Never under the ground: a low tilt on a slope would bury the lens.
         if let Some(h) = world.terrain_height_under(eye) {
             eye.y = eye.y.max(h + 0.6);
         }
@@ -418,19 +499,18 @@ pub(super) fn place_camera(
     }
 }
 
-/// Damage the hero takes from one blow, after immunity, armour and the shield; returns what got
-/// through.
-pub(super) fn hurt_hero(run: &mut Run, raw: f32) -> f32 {
-    if run.immune_t > 0.0 || run.dead_t.is_some() {
+/// Damage a hero takes from one blow, after immunity, armour and the shield; returns what got through.
+pub(super) fn hurt_hero(player: &mut PlayerState, raw: f32) -> f32 {
+    if player.immune_t > 0.0 || player.dead_t.is_some() {
         return 0.0;
     }
-    let mut dmg = (raw - run.stats().armor).max(1.0);
-    if run.shield_t > 0.0 && run.shield > 0.0 {
-        let absorbed = dmg.min(run.shield);
-        run.shield -= absorbed;
+    let mut dmg = (raw - player.stats().armor).max(1.0);
+    if player.shield_t > 0.0 && player.shield > 0.0 {
+        let absorbed = dmg.min(player.shield);
+        player.shield -= absorbed;
         dmg -= absorbed;
     }
-    run.hp -= dmg;
+    player.hp -= dmg;
     dmg
 }
 
@@ -439,79 +519,104 @@ pub(super) fn hero_vitals(
     time: Res<Time>,
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
-    mut hero: Query<(Entity, &Guid, &mut ObjectStore, &mut Marks), With<Hero>>,
+    mut heroes: Query<(Entity, &Guid, &mut ObjectStore, &mut Marks, &PlayerHero), With<Hero>>,
     mut fields: MessageWriter<FieldChanged>,
     mut fx: Fx,
 ) {
     let dt = time.delta_secs();
-    let stats = run.stats();
-    let Ok((entity, guid, mut store, mut marks)) = hero.single_mut() else {
-        return;
-    };
-    if let Some(t) = run.dead_t.as_mut() {
-        *t += dt;
-        if *t > 3.0 {
+    if !run.any_alive() {
+        let mut all_finished = !run.players.is_empty();
+        for player in &mut run.players {
+            if let Some(t) = player.dead_t.as_mut() {
+                *t += dt;
+                if *t <= 3.0 {
+                    all_finished = false;
+                }
+            } else {
+                all_finished = false;
+            }
+        }
+        if all_finished {
             next.set(Phase::GameOver);
         }
         return;
     }
-    run.elapsed += dt;
-    let r = &mut *run;
-    for t in [&mut r.shield_t, &mut r.immune_t, &mut r.thorns_t] {
-        *t = (*t - dt).max(0.0);
-    }
-    let mut heal = stats.regen * dt;
-    if run.heal_t > 0.0 {
-        heal += run.heal_rate * dt.min(run.heal_t);
-        run.heal_t = (run.heal_t - dt).max(0.0);
-    }
-    run.hp = (run.hp + heal).min(stats.max_hp);
 
-    // The buffs show as their own state kits: the shield bubble, the immunity glow, the orbs.
-    let mut shown: Vec<u32> = Vec::new();
-    if run.shield_t > 0.0 && run.shield > 0.0 {
-        shown.push(17);
+    run.match_state.elapsed += dt;
+    let won_now = run.match_state.elapsed >= data::VICTORY_SECS;
+    if won_now {
+        run.match_state.won = true;
     }
-    if run.immune_t > 0.0 {
-        shown.push(642);
-    }
-    if run.thorns_t > 0.0 {
-        shown.push(run.thorns_spell);
-    }
-    if run.heal_t > 0.0 {
-        shown.push(774);
-    }
-    for owned in &run.abilities {
-        if owned.def.key == "lightning_shield" {
-            shown.push(owned.def.spell);
+
+    for player in &mut run.players {
+        let Some((entity, guid, mut store, mut marks, _)) =
+            heroes.iter_mut().find(|(_, _, _, _, ph)| ph.0 == player.id)
+        else {
+            continue;
+        };
+        if let Some(t) = player.dead_t.as_mut() {
+            *t += dt;
+            continue;
+        }
+
+        let stats = player.stats();
+        for t in [
+            &mut player.shield_t,
+            &mut player.immune_t,
+            &mut player.thorns_t,
+        ] {
+            *t = (*t - dt).max(0.0);
+        }
+        let mut heal = stats.regen * dt;
+        if player.heal_t > 0.0 {
+            heal += player.heal_rate * dt.min(player.heal_t);
+            player.heal_t = (player.heal_t - dt).max(0.0);
+        }
+        player.hp = (player.hp + heal).min(stats.max_hp);
+
+        let mut shown: Vec<u32> = Vec::new();
+        if player.shield_t > 0.0 && player.shield > 0.0 {
+            shown.push(17);
+        }
+        if player.immune_t > 0.0 {
+            shown.push(642);
+        }
+        if player.thorns_t > 0.0 {
+            shown.push(player.thorns_spell);
+        }
+        if player.heal_t > 0.0 {
+            shown.push(774);
+        }
+        for owned in &player.abilities {
+            if owned.def.key == "lightning_shield" {
+                shown.push(owned.def.spell);
+            }
+        }
+        if player.has_passive_key("renew") {
+            shown.push(139);
+        }
+        marks.set(&shown);
+        marks.flush(entity, guid.0, &mut store, &mut fields);
+
+        if player.hp <= 0.0 {
+            player.hp = 0.0;
+            player.dead_t = Some(0.0);
+            units::kill_unit(&mut store);
+            marks.clear();
+            marks.flush(entity, guid.0, &mut store, &mut fields);
+        } else if won_now {
+            fx.cast(entity, 642, &[entity], None);
         }
     }
-    if run.passives.iter().any(|(p, _)| p.key == "renew") {
-        shown.push(139);
-    }
-    marks.set(&shown);
-    marks.flush(entity, guid.0, &mut store, &mut fields);
 
-    if run.hp <= 0.0 {
-        run.hp = 0.0;
-        run.dead_t = Some(0.0);
-        units::kill_unit(&mut store);
-        marks.clear();
-        marks.flush(entity, guid.0, &mut store, &mut fields);
-    } else if run.elapsed >= data::VICTORY_SECS {
-        run.won = true;
-        // A last flourish before the results.
-        fx.cast(entity, 642, &[entity], None);
+    if won_now {
         next.set(Phase::GameOver);
     }
 }
 
-/// The ground-plane distance from the hero, the measure every range in the mode uses.
-/// The movement flags for running `dir` while facing `look`: forward, backpedal or strafe, by
-/// which quarter the run falls in, so the walk, backpedal and strafe animations play.
+/// The movement flags for running `dir` while facing `look`: forward, backpedal or strafe.
 fn gait(look: Vec3, dir: Vec3) -> u32 {
     let ahead = look.dot(dir);
-    // Positive when `dir` is to the hero's left: WoW faces −Z with +X on the right.
     let left = look.cross(dir).y;
     let quarter = std::f32::consts::FRAC_1_SQRT_2;
     if ahead >= quarter {
@@ -546,7 +651,9 @@ mod tests {
     }
 
     fn left_held(world: &World) -> bool {
-        world.resource::<ButtonInput<MouseButton>>().pressed(MouseButton::Left)
+        world
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
     }
 
     #[test]
@@ -554,10 +661,16 @@ mod tests {
         let mut world = held_left();
         world.run_system_once(drop_stray_buttons).unwrap();
         assert!(left_held(&world), "nothing happened: the drag goes on");
-        world.write_message(WindowFocused { window: Entity::PLACEHOLDER, focused: true });
+        world.write_message(WindowFocused {
+            window: Entity::PLACEHOLDER,
+            focused: true,
+        });
         world.run_system_once(drop_stray_buttons).unwrap();
         assert!(left_held(&world), "gaining focus is no release");
-        world.write_message(WindowFocused { window: Entity::PLACEHOLDER, focused: false });
+        world.write_message(WindowFocused {
+            window: Entity::PLACEHOLDER,
+            focused: false,
+        });
         world.run_system_once(drop_stray_buttons).unwrap();
         assert!(!left_held(&world));
     }
@@ -565,7 +678,9 @@ mod tests {
     #[test]
     fn a_held_button_is_dropped_when_the_pointer_leaves_the_page() {
         let mut world = held_left();
-        world.write_message(CursorLeft { window: Entity::PLACEHOLDER });
+        world.write_message(CursorLeft {
+            window: Entity::PLACEHOLDER,
+        });
         world.run_system_once(drop_stray_buttons).unwrap();
         assert!(!left_held(&world));
     }

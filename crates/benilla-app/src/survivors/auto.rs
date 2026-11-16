@@ -158,6 +158,7 @@ pub(super) fn drive(
     mut auto: ResMut<Auto>,
     progress: Res<super::perks::Progress>,
     shop: Res<super::perk_shop::Shop>,
+    roster_ui: Res<super::menu::RosterUi>,
     phase: Res<State<Phase>>,
     mut next: ResMut<NextState<Phase>>,
     mut selection: ResMut<Selection>,
@@ -173,7 +174,7 @@ pub(super) fn drive(
     auto.frames += 1;
     match phase.get() {
         Phase::Menu => {
-            if shop.open {
+            if shop.open || roster_ui.open {
                 return;
             }
             if selection.map != auto.map {
@@ -190,16 +191,18 @@ pub(super) fn drive(
                 auto.wait = 0.0;
             } else if auto.wait > 2.0 && auto.wait < 3.0 {
                 auto.capture_once(&mut commands, "menu".into());
-            } else if auto.wait > 3.0 && hud::start_run(&mut run, &mut selection, &progress) {
+            } else if auto.wait > 3.0 && hud::start_run(&mut run, &mut selection, &progress, true) {
                 info!(
                     "survivors auto: run begins as {} at {}",
-                    run.class.name,
-                    selection.map_def().name
+                    run.local().class.name,
+                    run.match_state.config.map.name
                 );
                 if auto.all {
-                    for key in run.class.pool {
-                        if !run.abilities.iter().any(|o| o.def.key == *key) {
-                            run.abilities.push(super::Owned {
+                    let pool = run.local().class.pool;
+                    let player = run.local_mut();
+                    for key in pool {
+                        if !player.abilities.iter().any(|o| o.def.key == *key) {
+                            player.abilities.push(super::Owned {
                                 def: data::ability(key),
                                 level: 1,
                                 cd: 0.5,
@@ -208,21 +211,22 @@ pub(super) fn drive(
                     }
                 }
                 if auto.late {
-                    for o in &mut run.abilities {
+                    for o in &mut run.local_mut().abilities {
                         o.level = data::MAX_ABILITY_LEVEL;
                     }
-                    run.elapsed = data::VICTORY_SECS * 2.0 / 3.0;
-                    run.bosses = 3;
-                    run.rings = 4;
+                    run.match_state.elapsed = data::VICTORY_SECS * 2.0 / 3.0;
+                    run.match_state.bosses = 3;
+                    run.match_state.rings = 4;
                 }
                 next.set(Phase::Playing);
                 auto.wait = 0.0;
             }
         }
         Phase::LevelUp => {
+            let level = run.local().level;
             // After the deal-in, so the shot shows the cards settled.
-            if auto.wait > 1.2 && (run.level <= 3 || run.level == 10) {
-                auto.capture_once(&mut commands, format!("levelup-{}", run.level));
+            if auto.wait > 1.2 && (level <= 3 || level == 10) {
+                auto.capture_once(&mut commands, format!("levelup-{level}"));
             }
             if auto.wait > 1.6 {
                 let n = offer.len().max(1);
@@ -249,20 +253,26 @@ pub(super) fn drive(
         let fps = auto.frames as f32 / 10.0;
         auto.frames = 0;
         let alive = enemies.iter().filter(|e| !e.dead).count();
-        let build: Vec<String> = run
+        let player = run.local();
+        let build: Vec<String> = player
             .abilities
             .iter()
             .map(|o| format!("{}:{}", o.def.key, o.level))
-            .chain(run.passives.iter().map(|(p, l)| format!("{}:{}", p.key, l)))
+            .chain(
+                player
+                    .passives
+                    .iter()
+                    .map(|(p, l)| format!("{}:{}", p.key, l)),
+            )
             .collect();
         info!(
             "survivors auto: {:?} t={:.0}s fps={fps:.0} alive={alive} level={} hp={:.0} kills={} damage={:.0} build=[{}]",
             phase.get(),
-            run.elapsed,
-            run.level,
-            run.hp,
-            run.kills,
-            run.damage_done,
+            run.match_state.elapsed,
+            player.level,
+            player.hp,
+            player.kills,
+            player.damage_done,
             build.join(" ")
         );
     }

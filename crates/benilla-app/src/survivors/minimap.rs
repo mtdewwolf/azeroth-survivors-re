@@ -330,7 +330,7 @@ pub(super) fn zone_text(
     } else {
         row.name.clone()
     };
-    let (friend, enemy) = match run.race {
+    let (friend, enemy) = match run.local().race {
         1 | 3 | 4 | 7 => (GROUP_ALLIANCE, GROUP_HORDE),
         _ => (GROUP_HORDE, GROUP_ALLIANCE),
     };
