@@ -2,7 +2,7 @@
 
 <div align="center">
 
-# Azeroth Survivors
+# Azeroth Survivors Android
 
 **A free fan-made WoW roguelike by [Aethus](https://wow.aethus.pl/), run locally on a
 from-scratch WoW 1.12.1 client engine (Rust + [Bevy](https://bevy.org)).**
@@ -17,7 +17,7 @@ from-scratch WoW 1.12.1 client engine (Rust + [Bevy](https://bevy.org)).**
 > · [Discord](https://discord.gg/UzxaZuSAk)). This repository is a from-source local build of the
 > game, running on the [benilla](#how-its-built) / [wenilla](#how-its-built) engine, for personal use.
 
-Pick a class and a battleground, then survive: WASD to move, your abilities cast themselves,
+This fork adds an Android app with touch controls and persistent passive upgrades. Pick a class and a battleground, then survive: your abilities cast themselves,
 enemies swarm in waves, you level up and pick upgrades, and a boss shows up every couple of
 minutes. **No server, no login, no account** — fully offline and self-contained.
 
@@ -47,10 +47,48 @@ minutes. **No server, no login, no account** — fully offline and self-containe
   unlocks it to swing and tilt, and the wheel zooms from over the shoulder out to 70 yards.
 - A light sharpen-and-colour pass over the picture (**G** toggles it).
 
-## Play it
+## Android
+
+The Android app targets 64-bit ARM devices running Android 8.0 or later with Vulkan 1.1.
+Install a signed APK, open the app, and import an English WoW 1.12.1 build 5875
+`Data` folder or client ZIP. The imported data occupies about 5.4 GB. If importing
+a ZIP on the phone, allow space for both the ZIP and the extracted data.
+
+Use the left thumbstick to move and face. Tap **Jump**, **Skill**, **+ / −**, and
+**II** for jumping, the class movement skill, zoom, and pause. Tap the character
+picker, zones, and level-up cards directly.
+
+### Passive upgrades
+
+Completed runs award one point, plus one per full minute, one per 25 kills, two
+per boss, and five for a victory. Open **Passive upgrades** on the character menu
+to unlock a passive for 3 points. Successive upgrades cost 5, 7, 9, and 11 points.
+Equip up to six unlocked passives to start a run with their purchased ranks.
+Progress is stored locally on the device.
+
+### Build the Android APK
+
+Install Bun, Rust 1.98.1 with the `aarch64-linux-android` target, a JDK,
+Android SDK platform 35, Android build-tools 35.0.0, Android NDK r28c, and `zip`.
+Set `ANDROID_HOME` and `ANDROID_NDK_HOME`, then run:
 
 ```bash
-git clone https://github.com/OutThisLife/azeroth-survivors-re
+rustup target add aarch64-linux-android
+bun android/build.ts
+adb install -r android/.build/Azeroth-Survivors-Progression.apk
+```
+
+The build creates a local signing key at `android/.build/android-local.p12`.
+Keep the key private and retain it for updates. An existing key can be supplied
+using `ANDROID_KEYSTORE`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEYSTORE_PASSWORD`.
+
+The Android port is under development. Its latest changes require a full Android
+build and on-device verification.
+
+## Play in a browser
+
+```bash
+git clone https://github.com/mtdewwolf/azeroth-survivors-re
 cd azeroth-survivors-re
 make build     # fetch game data + install toolchain + build the wasm (~5.5 GB download)
 make start     # → open http://127.0.0.1:8090/
