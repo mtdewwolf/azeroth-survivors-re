@@ -92,6 +92,21 @@ pub(crate) fn config_path() -> Option<PathBuf> {
     home().map(|h| h.join("config.toml"))
 }
 
+/// `benilla-config/survivors-saves.toml`: Warcraft Survivors character slots and progression.
+pub(crate) fn survivors_saves_path() -> Option<PathBuf> {
+    home().map(|h| h.join("survivors-saves.toml"))
+}
+
+/// `benilla-config/survivors-passives.toml`: legacy Warcraft Survivors passive progress (migrated).
+pub(crate) fn survivors_legacy_passives_path() -> Option<PathBuf> {
+    home().map(|h| h.join("survivors-passives.toml"))
+}
+
+/// `benilla-config/survivors-pick.txt`: legacy Warcraft Survivors last pick (migrated).
+pub(crate) fn survivors_legacy_pick_path() -> Option<PathBuf> {
+    home().map(|h| h.join("survivors-pick.txt"))
+}
+
 /// `benilla-config/macros/account.txt`: the account-wide macro tab (indices 1..=18).
 pub(crate) fn macros_account_path() -> Option<PathBuf> {
     home().map(|h| h.join("macros/account.txt"))
@@ -409,6 +424,18 @@ mod tests {
         let _h = EnvGuard::set("BENILLA_HOME", tmp.join(STATE_DIR).to_str().unwrap());
         assert_eq!(home(), Some(tmp.join(STATE_DIR)));
         assert_eq!(config_path(), Some(tmp.join("benilla-config/config.toml")));
+        assert_eq!(
+            survivors_saves_path(),
+            Some(tmp.join("benilla-config/survivors-saves.toml"))
+        );
+        assert_eq!(
+            survivors_legacy_passives_path(),
+            Some(tmp.join("benilla-config/survivors-passives.toml"))
+        );
+        assert_eq!(
+            survivors_legacy_pick_path(),
+            Some(tmp.join("benilla-config/survivors-pick.txt"))
+        );
         assert_eq!(
             macros_account_path(),
             Some(tmp.join("benilla-config/macros/account.txt"))

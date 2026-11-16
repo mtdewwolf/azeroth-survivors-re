@@ -20,6 +20,7 @@ mod minimap;
 mod mobility;
 mod perk_shop;
 mod perks;
+mod state;
 #[cfg(target_os = "android")]
 mod touch;
 mod units;
@@ -27,7 +28,8 @@ mod units;
 use benilla_world::schedule::WorldStage;
 use bevy::prelude::*;
 
-use data::{AbilityDef, ClassDef, PassiveDef, Stat};
+use data::ClassDef;
+use state::{Owned, PlayerHero, PlayerId, PlayerInputs, Run, RunConfig, Stats};
 
 /// Set by [`crate::run_survivors`] before the app builds. wasm32 has no process environment, so
 /// the flag lives here; `WOW_SURVIVORS` (`?survivors=1` / `__wenilla_env.survivors` on the web)
@@ -50,8 +52,10 @@ impl Plugin for SurvivorsPlugin {
             .init_resource::<Rng>()
             .init_resource::<Selection>()
             .init_resource::<Run>()
+            .init_resource::<PlayerInputs>()
             .init_resource::<perks::Progress>()
             .init_resource::<perk_shop::Shop>()
+            .init_resource::<menu::RosterUi>()
             .add_systems(Startup, perks::load)
             .init_resource::<hero::CamRig>()
             .init_resource::<hero::AimPoint>()
@@ -70,6 +74,7 @@ impl Plugin for SurvivorsPlugin {
                 (
                     hero::drop_stray_buttons,
                     hero::aim_cursor,
+                    hero::collect_local_input,
                     mobility::cast_mobility,
                     hero::drive_hero,
                     hero::place_camera,
@@ -111,6 +116,7 @@ impl Plugin for SurvivorsPlugin {
                     menu::restore_pick,
                     menu::build_menu,
                     menu::menu_clicks,
+                    menu::roster_text_input,
                     menu::refresh_menu_ui.before(crate::glue::GlueVisuals),
                     perk_shop::refresh.run_if(in_state(Phase::Menu)),
                     cards::deal_cards,
@@ -176,7 +182,7 @@ pub(super) enum Phase {
 #[derive(Component)]
 pub(super) struct RunEntity;
 
-/// The class, look and battleground picked at the menu; the battleground holds for the run.
+/// The class, look, battleground, and difficulty picked at the menu; the battleground holds for the run.
 #[derive(Resource, Default)]
 pub(super) struct Selection {
     pub class: Option<usize>,
@@ -185,6 +191,8 @@ pub(super) struct Selection {
     pub look: Option<usize>,
     /// An index into [`data::MAPS`].
     pub map: usize,
+    /// Selected difficulty tier.
+    pub tier: data::DifficultyTier,
     /// The battleground the world is standing in: the last one entered (or the saved pick at
     /// boot). Picking another at the menu changes only `map`, so the menu hero stays put and no
     /// loading screen rises until Enter World.
@@ -204,168 +212,6 @@ impl Selection {
 
     pub fn stage_def(&self) -> &'static data::MapDef {
         &data::MAPS[self.stage.min(data::MAPS.len() - 1)]
-    }
-}
-
-/// An ability the hero has, with its own cooldown.
-pub(super) struct Owned {
-    pub def: &'static AbilityDef,
-    pub level: u8,
-    pub cd: f32,
-}
-
-impl Owned {
-    pub fn damage_mult(&self) -> f32 {
-        1.0 + 0.3 * f32::from(self.level - 1)
-    }
-    pub fn cooldown(&self, stats: &Stats) -> f32 {
-        let base = self.def.cooldown * 0.93f32.powi(i32::from(self.level) - 1);
-        (base * (1.0 - stats.haste).max(0.35)).max(0.2)
-    }
-    pub fn count(&self) -> u32 {
-        let extra = [3u8, 5, 7].iter().filter(|&&l| self.level >= l).count() as u32;
-        self.def.count + extra
-    }
-    pub fn radius(&self, stats: &Stats) -> f32 {
-        self.def.radius * (1.0 + 0.08 * f32::from(self.level - 1)) * stats.area
-    }
-    pub fn duration(&self) -> f32 {
-        self.def.duration * (1.0 + 0.1 * f32::from(self.level - 1))
-    }
-}
-
-/// The hero's derived numbers, from the base and the passives.
-#[derive(Clone, Copy)]
-pub(super) struct Stats {
-    pub might: f32,
-    pub max_hp: f32,
-    pub speed: f32,
-    pub regen: f32,
-    pub haste: f32,
-    pub area: f32,
-    pub magnet: f32,
-    pub growth: f32,
-    pub armor: f32,
-    pub crit: f32,
-}
-
-pub(super) const BASE_HP: f32 = 120.0;
-pub(super) const BASE_SPEED: f32 = 7.0;
-pub(super) const BASE_MAGNET: f32 = 4.5;
-
-/// One run's state.
-#[derive(Resource)]
-pub(super) struct Run {
-    pub class: &'static ClassDef,
-    pub race: u8,
-    pub elapsed: f32,
-    pub kills: u32,
-    pub level: u32,
-    pub xp: f32,
-    pub hp: f32,
-    pub abilities: Vec<Owned>,
-    pub passives: Vec<(&'static PassiveDef, u8)>,
-    pub shield: f32,
-    pub shield_t: f32,
-    pub immune_t: f32,
-    pub thorns: f32,
-    pub thorns_t: f32,
-    pub thorns_spell: u32,
-    pub heal_rate: f32,
-    pub heal_t: f32,
-    /// The class mobility's cooldown and running effect.
-    mobile: mobility::MobilityState,
-    pub pending_levels: u32,
-    pub bosses: u32,
-    pub rings: u32,
-    pub won: bool,
-    /// Seconds since the hero fell, while the death plays out.
-    pub dead_t: Option<f32>,
-    pub next_guid: u64,
-    pub damage_done: f64,
-    pub passive_reward: Option<Result<u32, &'static str>>,
-    /// Bumped whenever abilities or passives change, so the HUD rebuilds the icon rows once.
-    pub version: u32,
-    /// A centre-screen announcement and its seconds left.
-    pub banner: Option<(String, f32)>,
-}
-
-impl Default for Run {
-    fn default() -> Self {
-        Self {
-            class: &data::CLASSES[0],
-            race: 0,
-            elapsed: 0.0,
-            kills: 0,
-            level: 1,
-            xp: 0.0,
-            hp: BASE_HP,
-            abilities: Vec::new(),
-            passives: Vec::new(),
-            shield: 0.0,
-            shield_t: 0.0,
-            immune_t: 0.0,
-            thorns: 0.0,
-            thorns_t: 0.0,
-            thorns_spell: 0,
-            heal_rate: 0.0,
-            heal_t: 0.0,
-            mobile: mobility::MobilityState::default(),
-            pending_levels: 0,
-            bosses: 0,
-            rings: 0,
-            won: false,
-            dead_t: None,
-            next_guid: 1,
-            damage_done: 0.0,
-            passive_reward: None,
-            version: 0,
-            banner: None,
-        }
-    }
-}
-
-impl Run {
-    pub fn stats(&self) -> Stats {
-        let mut s = Stats {
-            might: 1.0,
-            max_hp: BASE_HP,
-            speed: BASE_SPEED,
-            regen: 0.0,
-            haste: 0.0,
-            area: 1.0,
-            magnet: BASE_MAGNET,
-            growth: 1.0,
-            armor: 0.0,
-            crit: 0.05,
-        };
-        // Tanky classes start tougher, cloth starts quicker.
-        match self.class.id {
-            1 | 2 => s.max_hp += 40.0,
-            7 | 11 | 3 | 4 => s.max_hp += 15.0,
-            _ => s.speed += 0.5,
-        }
-        for &(p, level) in &self.passives {
-            let v = p.per_level * f32::from(level);
-            match p.stat {
-                Stat::Might => s.might += v,
-                Stat::MaxHp => s.max_hp *= 1.0 + v,
-                Stat::Speed => s.speed *= 1.0 + v,
-                Stat::Regen => s.regen += v,
-                Stat::Haste => s.haste += v,
-                Stat::Area => s.area += v,
-                Stat::Magnet => s.magnet *= 1.0 + v,
-                Stat::Growth => s.growth += v,
-                Stat::Armor => s.armor += v,
-                Stat::Crit => s.crit += v,
-            }
-        }
-        s
-    }
-
-    pub fn guid(&mut self) -> u64 {
-        self.next_guid += 1;
-        self.next_guid
     }
 }
 
@@ -417,6 +263,7 @@ fn reset_run(
     mut commands: Commands,
     spawned: Query<Entity, With<RunEntity>>,
     mut run: ResMut<Run>,
+    mut inputs: ResMut<PlayerInputs>,
     mut pending: ResMut<abilities::PendingHits>,
     mut spawner: ResMut<enemies::Spawner>,
     mut selection: ResMut<Selection>,
@@ -425,11 +272,9 @@ fn reset_run(
         commands.entity(e).despawn();
     }
     // Guids stay unique across runs: caches keyed by guid may outlive a despawn by a frame.
-    let next_guid = run.next_guid;
-    *run = Run {
-        next_guid,
-        ..Run::default()
-    };
+    let next_guid = run.match_state.next_guid;
+    *run = Run::from_config(RunConfig::default(), next_guid);
+    inputs.clear_all();
     pending.0.clear();
     *spawner = enemies::Spawner::default();
     // The preview hero is respawned for the look still picked.

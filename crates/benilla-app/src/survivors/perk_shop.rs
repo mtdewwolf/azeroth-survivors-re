@@ -8,6 +8,7 @@ use super::{
     menu::MenuAction,
     perks::{Progress, SLOTS},
 };
+use crate::glue::widgets::GlueDisabled;
 
 const MUTED: Color = Color::srgb(0.77, 0.70, 0.61);
 const EDGE: Color = Color::srgb(0.44, 0.34, 0.22);
@@ -15,13 +16,14 @@ const EDGE: Color = Color::srgb(0.44, 0.34, 0.22);
 #[derive(Resource, Default)]
 pub(super) struct Shop {
     pub(super) open: bool,
-    feedback: &'static str,
+    feedback: String,
 }
 
 #[derive(Component)]
 pub(super) enum Panel {
     Picker,
     Passives,
+    Characters,
 }
 
 #[derive(Component)]
@@ -44,18 +46,8 @@ pub(super) fn full_panel() -> Node {
     }
 }
 
-pub(super) fn launcher(ui: &mut ChildSpawnerCommands, f: &Handle<Font>) {
-    ui.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(22.0),
-            width: Val::Percent(100.0),
-            justify_content: JustifyContent::Center,
-            ..default()
-        },
-        FocusPolicy::Pass,
-    ))
-    .with_children(|row| button(row, f, MenuAction::OpenPassives, "Passive upgrades", 270.0));
+pub(super) fn launcher_button(ui: &mut ChildSpawnerCommands, f: &Handle<Font>) {
+    button(ui, f, MenuAction::OpenPassives, "Passive upgrades", 260.0);
 }
 
 pub(super) fn build(ui: &mut ChildSpawnerCommands, f: &Handle<Font>) {
@@ -95,12 +87,21 @@ pub(super) fn build(ui: &mut ChildSpawnerCommands, f: &Handle<Font>) {
                         title.spawn(text_bundle(f, "Passive upgrades", 32.0, GOLD));
                         title.spawn((Caption::Balance, text_bundle(f, "", 20.0, MUTED)));
                     });
-                button(header, f, MenuAction::ClosePassives, "Back", 120.0);
+                header
+                    .spawn(Node {
+                        column_gap: Val::Px(10.0),
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|btns| {
+                        button(btns, f, MenuAction::RespecPassives, "Respec", 190.0);
+                        button(btns, f, MenuAction::ClosePassives, "Back", 120.0);
+                    });
             });
             body.spawn(text_bundle(
                 f,
-                "Finish runs to earn points. Equip up to six passives for your next run.",
-                20.0,
+                "Finish runs to earn points. Equip up to six meta-passives (separate from your 6 in-run passive slots).",
+                19.0,
                 MUTED,
             ));
             for first in (0..data::PASSIVES.len()).step_by(2) {
@@ -143,11 +144,15 @@ fn card(row: &mut ChildSpawnerCommands, f: &Handle<Font>, index: usize) {
         BorderColor::all(EDGE),
     ))
     .with_children(|card| {
-        card.spawn(Node { align_items: AlignItems::Center, column_gap: Val::Px(9.0), ..default() })
-            .with_children(|head| {
-                head.spawn((icon(data::PASSIVES[index].spell, 40.0), FocusPolicy::Pass));
-                head.spawn(text_bundle(f, data::PASSIVES[index].name, 21.0, GOLD));
-            });
+        card.spawn(Node {
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(9.0),
+            ..default()
+        })
+        .with_children(|head| {
+            head.spawn((icon(data::PASSIVES[index].spell, 40.0), FocusPolicy::Pass));
+            head.spawn(text_bundle(f, data::PASSIVES[index].name, 21.0, GOLD));
+        });
         card.spawn((Caption::Effect(index), text_bundle(f, "", 18.0, MUTED)));
         card.spawn(Node {
             column_gap: Val::Px(8.0),
@@ -170,6 +175,7 @@ fn button(
     ui.spawn((
         ShopButton,
         action,
+        GlueDisabled(false),
         Button,
         Node {
             width: Val::Px(width),
@@ -199,35 +205,55 @@ impl Shop {
         match action {
             MenuAction::OpenPassives => {
                 self.open = true;
-                self.feedback = "";
+                self.feedback.clear();
             }
             MenuAction::ClosePassives => self.close(),
             MenuAction::BuyPassive(index) if self.open => {
                 self.feedback = progress
                     .buy(index)
-                    .map_or_else(|error| error, |()| "Starting rank saved.");
+                    .map_or_else(str::to_owned, |()| "Starting rank saved.".into());
             }
             MenuAction::EquipPassive(index) if self.open => {
                 self.feedback = progress
                     .toggle(index)
-                    .map_or_else(|error| error, |()| "Starting loadout saved.");
+                    .map_or_else(str::to_owned, |()| "Starting loadout saved.".into());
             }
-            MenuAction::BuyPassive(_) | MenuAction::EquipPassive(_) => {}
+            MenuAction::RespecPassives if self.open => {
+                self.feedback = match progress.respec() {
+                    Ok(refund) => format!("Refunded {refund} points. Loadout cleared."),
+                    Err(error) => error.to_owned(),
+                };
+            }
+            MenuAction::BuyPassive(_)
+            | MenuAction::EquipPassive(_)
+            | MenuAction::RespecPassives => {}
             _ => return self.open,
         }
         true
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn refresh(
     shop: Res<Shop>,
     progress: Res<Progress>,
     mut panels: Query<(&Panel, &mut Node, &mut Visibility)>,
     mut texts: Query<(&Caption, &mut Text)>,
-    mut buttons: Query<(&MenuAction, &Interaction, &mut BackgroundColor), With<ShopButton>>,
+    mut buttons: Query<
+        (
+            &MenuAction,
+            &Interaction,
+            &mut BackgroundColor,
+            &mut GlueDisabled,
+        ),
+        With<ShopButton>,
+    >,
 ) {
     for (panel, mut node, mut visible) in &mut panels {
-        let show = shop.open == matches!(panel, Panel::Passives);
+        if !matches!(panel, Panel::Passives) {
+            continue;
+        }
+        let show = shop.open;
         let visibility = if show {
             Visibility::Inherited
         } else {
@@ -241,18 +267,20 @@ pub(super) fn refresh(
             node.display = display;
         }
     }
+    let spent = progress.spent_points();
     for (label, mut text) in &mut texts {
         let value = match *label {
             Caption::Balance => format!(
-                "{} points   •   {}/{} equipped",
+                "{} points   •   {}/{} equipped   •   {} spent",
                 progress.points(),
                 progress.equipped_count(),
-                SLOTS
+                SLOTS,
+                spent,
             ),
             Caption::Feedback => if progress.load_error && shop.feedback.is_empty() {
-                "Could not read saved passive progress."
+                "Could not read saved progress."
             } else {
-                shop.feedback
+                &shop.feedback
             }
             .to_owned(),
             Caption::Effect(index) => {
@@ -267,6 +295,13 @@ pub(super) fn refresh(
             }
             Caption::Button(MenuAction::OpenPassives) => {
                 format!("Passive upgrades  •  {} pts", progress.points())
+            }
+            Caption::Button(MenuAction::RespecPassives) => {
+                if spent > 0 {
+                    format!("Respec · {spent} pts")
+                } else {
+                    "Respec".to_owned()
+                }
             }
             Caption::Button(MenuAction::BuyPassive(index)) => match progress.price(index) {
                 None => "Max rank".to_owned(),
@@ -287,7 +322,7 @@ pub(super) fn refresh(
             **text = value;
         }
     }
-    for (action, interaction, mut background) in &mut buttons {
+    for (action, interaction, mut background, mut disabled) in &mut buttons {
         let available = match *action {
             MenuAction::BuyPassive(index) => progress
                 .price(index)
@@ -296,8 +331,12 @@ pub(super) fn refresh(
                 progress.rank(index) > 0
                     && (progress.equipped(index) || progress.equipped_count() < SLOTS)
             }
+            MenuAction::RespecPassives => spent > 0,
             _ => true,
         };
+        if disabled.0 != !available {
+            disabled.0 = !available;
+        }
         let color = if !available {
             Color::srgb(0.14, 0.105, 0.081)
         } else if *interaction != Interaction::None {
